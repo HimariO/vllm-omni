@@ -22,6 +22,16 @@ from vllm_omni.model_executor.models.bagel.bagel import (
     OmniBagelProcessingInfo,
 )
 
+# Per-task image target side for the generation output grid.  Recon3D decodes
+# ``num_views`` square views at this VAE side; the AR stage caches the same
+# value in ``kv_metadata["image_shape"]`` so the DiT stage (SenseNovaVisionPipeline)
+# and the AR prefill agree on the latent grid.
+RECON3D_VAE_SIDE = 512
+
+# ``num_output_vae`` in upstream ``gen_image`` (inferencer.py) when no explicit
+# per-request ``num_views`` is supplied.
+RECON3D_DEFAULT_NUM_VIEWS = 4
+
 # SenseNova-Vision-7B-MoT defaults.  The checkpoint ships metadata-only
 # ``config.json`` (no ``architectures``), so these constants mirror what the
 # official ``SenseNovaVisionModel._build_model`` applies at load time
@@ -35,17 +45,22 @@ SENSENOVA_VISION_DEFAULT_MAX_LATENT_SIZE = 64
 SENSENOVA_VISION_DEFAULT_VIT_MAX_NUM_PATCH_PER_SIDE = 70
 
 
-class OmniSenseNovaVisionProcessingInfo(OmniBagelProcessingInfo):
-    """Multi-modal limits for SenseNova-Vision.
+class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
+    """SenseNovaVision multimodal processor with recon3d view plumbing.
 
-    The shared BAGEL base caps ``image`` / ``img2img`` at 1 item per request;
-    SenseNova-Vision raises both to 10, matching the upstream recon3d
-    ``max_images=10``.  A finite cap (never ``None``) keeps mm memory
-    profiling bounded.
+    Subclasses :class:`OmniBagelMultiModalProcessor` additively: it passes
+    ``target_h``/``target_w`` through for the generation ``image`` modality so a
+    recon3 request can request the VAE target shape per view, and records
+    ``num_views`` for downstream sampling knobs.  Add-only — the base processor
+    is left registered for SenseNovaVision because the AR stage feeds it the
+    same BAGEL-compatible fields.
     """
 
-    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": 10, "img2img": 10}
+    def _mm_kwargs_for_bagel_img2img_hf(self, mm_kwargs):
+        # SenseNovaVision recon3d views are decoded additively from the AR KV
+        # cache; ``target_h``/``target_w`` select the VAE output side and are
+        # preserved through to the ``image_shape`` used by the DiT stage.
+        return dict(mm_kwargs)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
