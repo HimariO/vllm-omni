@@ -494,7 +494,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             {
                 "stage_id": 0,
                 "max_num_seqs": 3,
-                "gpu_memory_utilization": 0.45,
+                # "gpu_memory_utilization": 0.45,
             },
             {
                 "stage_id": 1,
@@ -511,12 +511,12 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             {
                 "stage_id": 0,
                 "max_num_seqs": 3,
-                "gpu_memory_utilization": 0.45,
+                # "gpu_memory_utilization": 0.45,
             },
             {
                 "stage_id": 1,
                 "max_num_seqs": 1,
-                "gpu_memory_utilization": 0.45,
+                # "gpu_memory_utilization": 0.45,
             },
         ],
     },
