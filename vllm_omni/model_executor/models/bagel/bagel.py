@@ -8,6 +8,7 @@ from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs import ModalityData, MultiModalDataDict
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
@@ -50,6 +51,8 @@ from vllm_omni.diffusion.models.bagel.bagel_transformer import (
     TimestepEmbedder,
 )
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import default_ae_params
+
+logger = init_logger(__name__)
 
 
 class OmniBagelProcessor(BagelProcessor):
@@ -224,6 +227,31 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
         # BagelProcessor does not accept these in img2img mode; strip here so callers
         # (e.g. serving_chat) can stay model-agnostic.
         return {k: v for k, v in mm_kwargs.items() if k not in ("target_h", "target_w")}
+
+    def _apply_hf_processor(self, inputs, timing_ctx):
+        # Parity guard for the caption_generate (mixed) decode loop: log the
+        # exact token ids that enter the AR prefill so GPU runs can verify the
+        # bos-opener scaffold survives processing (expected tail for mixed:
+        # ... {prompt} <|im_end|> <|im_start|>  — sampling resumes from the
+        # trailing bare <|im_start|>, mirroring upstream prepare_start_tokens).
+        # vLLM returns (prompt_ids, MultiModalProcessingInfo, is_update_applied).
+        prompt_ids, _mm_info, _updated = super()._apply_hf_processor(inputs, timing_ctx)
+        try:
+            if inputs.mm_data_items.get_all_counts().get("img2img", 0) > 0:
+                ids = list(prompt_ids)
+                tok = self.info.get_tokenizer()
+                head = tok.decode(ids[:16])
+                tail = tok.decode(ids[-16:])
+                logger.info(
+                    "BAGEL AR prompt tokens: len=%d head=%r tail=%r",
+                    len(ids),
+                    head,
+                    tail,
+                )
+        except Exception:
+            # Never break serving on the probe, but DO surface why it skipped.
+            logger.warning("BAGEL AR prompt-token probe failed", exc_info=True)
+        return prompt_ids, _mm_info, _updated
 
     def _cached_apply_hf_processor(self, inputs, timing_ctx):
         # img2img: prompt text must be modified based on mm data presence,
@@ -475,6 +503,27 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self._start_of_image_id = int(_tok.convert_tokens_to_ids("<|vision_start|>"))
         self._end_of_image_id = int(_tok.convert_tokens_to_ids("<|vision_end|>"))
         self._img2img_token_id = int(_tok.convert_tokens_to_ids("<|fim_middle|>"))
+        # Stash for the forward-time prompt-token parity probe.
+        self._probe_tokenizer = _tok
+        # Parity guard for the AR decode loop: upstream caption generation
+        # stops on new_token_ids['eos_token_id'] (Bagel.generate_text) and the
+        # scaffold's <|im_start|>/<|im_end|> must map to those same bos/eos
+        # ids.  A renumbered tokenizer would silently break stop detection and
+        # every scaffold marker, so log the resolved ids once per engine init.
+        _bos_id = int(_tok.convert_tokens_to_ids("<|im_start|>"))
+        _eos_id = int(getattr(_tok, "eos_token_id", None) or _tok.convert_tokens_to_ids("<|im_end|>"))
+        logger.info(
+            "BAGEL AR special-token ids: class=%s len=%d "
+            "<|im_start|>(bos)=%d <|im_end|>(eos,stop)=%d <|vision_start|>=%d "
+            "<|vision_end|>=%d <|fim_middle|>=%d",
+            type(_tok).__name__,
+            len(_tok),
+            _bos_id,
+            _eos_id,
+            self._start_of_image_id,
+            self._end_of_image_id,
+            self._img2img_token_id,
+        )
         self._vae_token_mask: torch.Tensor | None = None
         # Whether the current request packs any VAE / non-VAE tokens, refreshed
         # in _adjust_positions_for_img2img. Cached as plain bools so the per-layer
@@ -747,6 +796,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
 
         if self._pending_img2img_info:
+            self._log_prompt_token_probe(input_ids)
             positions = self._adjust_positions_for_img2img(positions, input_ids)
             use_mot = True
 
@@ -766,6 +816,34 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         if use_mot:
             return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
         return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+
+    def _log_prompt_token_probe(self, input_ids: torch.Tensor | None) -> None:
+        """Forward-time parity probe: log the exact token ids entering the
+
+        AR prefill for img2img requests.  Runs inside ``forward()`` so it
+        cannot be skipped by processor caching paths; failures are LOUD.
+        Expected mixed/caption_generate tail: {p} <|im_end|> <|im_start|>.
+        """
+        try:
+            if input_ids is None:
+                # Warmup/profiling passes feed embeddings only - not an error.
+                logger.debug("BAGEL AR prompt-token probe: input_ids is None (warmup)")
+                return
+            ids = input_ids.flatten().tolist()
+            tok = getattr(self, "_probe_tokenizer", None)
+            if tok is not None:
+                head_s = repr(tok.decode(ids[:16]))
+                tail_s = repr(tok.decode(ids[-16:]))
+            else:
+                head_s = tail_s = "<no tokenizer>"
+            logger.info(
+                "BAGEL AR fwd prompt tokens: n=%d head=%s tail=%s",
+                len(ids),
+                head_s,
+                tail_s,
+            )
+        except Exception:
+            logger.warning("BAGEL AR prompt-token probe failed", exc_info=True)
 
     def _adjust_positions_for_img2img(
         self,
