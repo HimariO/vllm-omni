@@ -162,15 +162,24 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
 
             new_h, new_w = _sensenova_vae_resize_dims(int(h), int(w))
             num_vae_patches = (new_h // latent_downsample) * (new_w // latent_downsample)
-            num_vae_total = num_vae_patches + 2
-            num_vit_total = num_vit_patches + 2
-            # +1 separator between VAE and ViT blocks so that
-            # extract_embeds_range() produces two distinct mm_prefix_range
-            # entries, preventing VAE tokens from attending to ViT.
-            total = num_vae_total + 1 + num_vit_total
-            tokens = [img2img_token_id] * total
+            # Upstream-exact layout (Bagel prepare_vae_images /
+            # prepare_vit_images): each block bracketed by <|vision_start|> ...
+            # <|vision_end|>, blocks ADJACENT - no <|fim_middle|> placeholder
+            # run and no separator token ever appear in upstream sequences.
+            # The bracket pairs keep the two embed islands distinct for
+            # mm_prefix_range (bidirectional-within-island masking).
+            start_of_image_id = tokenizer.get_vocab()["<|vision_start|>"]
+            end_of_image_id = tokenizer.get_vocab()["<|vision_end|>"]
+            tokens = (
+                [start_of_image_id]
+                + [img2img_token_id] * num_vae_patches
+                + [end_of_image_id]
+                + [start_of_image_id]
+                + [img2img_token_id] * num_vit_patches
+                + [end_of_image_id]
+            )
 
-            embed_mask = [True] * num_vae_total + [False] + [True] * num_vit_total
+            embed_mask = [False] + [True] * num_vae_patches + [False] + [False] + [True] * num_vit_patches + [False]
             return PromptUpdateDetails(
                 full=tokens,
                 is_embed=lambda _tok, _seq, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
@@ -272,20 +281,66 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             )
         return pixel_values
 
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """SenseNova-Vision img2img bookkeeping (upstream-exact block layout).
+
+        Mirrors ``OmniBagelForConditionalGeneration.forward`` but with the
+        SEPARATOR-FREE block span (``num_vae + num_vit`` tokens, see
+        ``_get_prompt_updates`` above): the BAGEL base assumes a legacy
+        ``<|fim_middle|>`` separator between the VAE and ViT sections that
+        upstream sequences never contain.
+        """
+        use_mot = False
+        seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
+
+        if self._pending_img2img_info:
+            self._log_prompt_token_probe(input_ids)
+            positions = self._adjust_positions_for_img2img(positions, input_ids)
+            use_mot = True
+        elif self._last_img2img_info is not None:
+            info = self._last_img2img_info
+            num_vae, num_vit, _, _ = info
+            num_img2img = num_vae + num_vit  # no separator (upstream-exact)
+
+            if seq_len >= num_img2img:
+                self._pending_img2img_info = [info]
+                positions = self._adjust_positions_for_img2img(positions, input_ids)
+                use_mot = True
+            else:
+                rope = positions[seq_len - 1] + 1
+                self._ropes_pending.append({"ropes": [rope]})
+
+        if use_mot:
+            return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+        # Text-only / img2text path: bypass the BAGEL base's img2img
+        # bookkeeping (its separator-based span math does not apply here).
+        return super(OmniBagelForConditionalGeneration, self).forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+        )
+
     def _adjust_positions_for_img2img(
         self,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Rewrite position IDs for img2img.
+        """Rewrite position IDs for img2img (upstream-exact block layout).
 
-        Supports an optional ``pre_text_len`` prefix (thinking-mode) detected
-        via the ``<|fim_middle|>`` token in *input_ids*:
+        Blocks are ``[<|vision_start|>] fim-patches [<|vision_end|>]
+        [<|vision_start|>] fim-patches [<|vision_end|>]`` -- ADJACENT, no
+        separator token (see ``_get_prompt_updates``).  Detected via the
+        leading ``<|vision_start|>`` (thinking-mode pre-text never carries
+        vision tokens):
 
             pre_text -> 0 .. M-1
-            VAE      -> M       (all share)
-            separator-> M
-            ViT      -> M+1     (all share)
+            VAE sect -> M       (all share, markers included)
+            ViT sect -> M+1     (all share, markers included)
             post_text-> M+2, M+3, ...
 
         When M=0 (standard img2img) this reduces to VAE->0, ViT->1, text->2..
@@ -327,27 +382,38 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             end = boundaries[req_idx + 1]
             req_len = end - start
 
-            # Match this request's <|fim_middle|> blocks against the pending
-            # infos. A block is a contiguous placeholder stretch of exactly
-            # ``num_vae + 1 + num_vit`` tokens for its image, so adjacent
-            # blocks (no text between them) concatenate into longer runs that
-            # this scan still splits correctly by advancing block_len tokens
-            # per matched info. Infos left over stay queued for the following
-            # requests in the batch.
+            # Match this request's img2img blocks against the pending infos.
+            # A block is ``[<|vision_start|>] fim-patches [<|vision_end|>]
+            # [<|vision_start|>] fim-patches [<|vision_end|>]`` -- exactly
+            # ``num_vae + num_vit`` tokens, NO separator -- so adjacent blocks
+            # concatenate into longer runs that this scan still splits
+            # correctly by advancing block_len tokens per matched info.
+            # Infos left over stay queued for the following requests in the
+            # batch.
             spans = []
             if ids_list is not None and img2img_idx < len(info_list):
                 req_ids = ids_list[start:end]
-                tok = self._img2img_token_id
+                soi = self._start_of_image_id
+                eoi = self._end_of_image_id
+                fim = self._img2img_token_id
                 scan = 0
                 info_i = img2img_idx
                 while info_i < len(info_list):
                     num_vae, num_vit = info_list[info_i][0], info_list[info_i][1]
-                    block_len = num_vae + 1 + num_vit
-                    while scan < req_len and req_ids[scan] != tok:
+                    block_len = num_vae + num_vit  # no separator
+                    while scan < req_len and req_ids[scan] != soi:
                         scan += 1
                     if scan >= req_len or req_len - scan < block_len:
                         break
-                    if any(req_ids[scan + j] != tok for j in range(block_len)):
+                    blk = req_ids[scan : scan + block_len]
+                    if (
+                        blk[0] != soi
+                        or blk[num_vae - 1] != eoi
+                        or blk[num_vae] != soi
+                        or blk[-1] != eoi
+                        or any(t != fim for t in blk[1 : num_vae - 1])
+                        or any(t != fim for t in blk[num_vae + 1 : -1])
+                    ):
                         break
                     spans.append((scan, *info_list[info_i]))
                     scan += block_len
@@ -356,10 +422,10 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             if spans:
                 # Logical positions are rebased per request: leading text keeps
                 # 0..M1-1, every block collapses to TWO shared logical positions
-                # (VAE+separator -> M, ViT -> M+1) regardless of token count,
-                # and text after a block resumes at M+2. NOTE: a block's logical
-                # anchor M is NOT its token offset once earlier blocks have
-                # compressed their tokens, hence the threaded cursor.
+                # (VAE section -> M, ViT section -> M+1) regardless of token
+                # count, and text after a block resumes at M+2. NOTE: a block's
+                # logical anchor M is NOT its token offset once earlier blocks
+                # have compressed their tokens, hence the threaded cursor.
                 first_off = spans[0][0]
                 if first_off > 0:
                     new_positions[start : start + first_off] = torch.arange(
@@ -368,14 +434,14 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
                 logical_m = first_off
                 for k, (off, num_vae, num_vit, img_H, img_W) in enumerate(spans):
                     img_start = start + off
-                    vit_start = img_start + num_vae + 1
-                    new_positions[img_start:vit_start] = logical_m  # VAE section + separator
+                    vit_start = img_start + num_vae  # no separator
+                    new_positions[img_start:vit_start] = logical_m  # VAE section (markers incl.)
                     new_positions[vit_start : vit_start + num_vit] = logical_m + 1  # ViT section
                     vae_lo = img_start + 1
                     vae_hi = img_start + num_vae - 1
                     if vae_hi > vae_lo:
                         vae_mask[vae_lo:vae_hi] = True
-                    block_end = off + num_vae + 1 + num_vit
+                    block_end = off + num_vae + num_vit
                     next_off = spans[k + 1][0] if k + 1 < len(spans) else req_len
                     gap_len = next_off - block_end
                     if gap_len > 0:
@@ -405,13 +471,13 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
 
             if cur_info is not None:
                 num_vae, num_vit, img_H, img_W = cur_info
-                num_img2img = num_vae + 1 + num_vit  # +1 separator
+                num_img2img = num_vae + num_vit  # no separator (upstream-exact)
 
                 if req_len >= num_img2img:
                     pre_text_len = 0
                     if input_ids is not None:
                         req_ids_slice = input_ids[start:end]
-                        indices = (req_ids_slice == self._img2img_token_id).nonzero(as_tuple=True)[0]
+                        indices = (req_ids_slice == self._start_of_image_id).nonzero(as_tuple=True)[0]
                         if indices.numel() > 0:
                             pre_text_len = int(indices[0].item())
 
@@ -425,8 +491,7 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
                         )
 
                     new_positions[img_start : img_start + num_vae] = M
-                    new_positions[img_start + num_vae] = M  # separator
-                    vit_start = img_start + num_vae + 1
+                    vit_start = img_start + num_vae  # no separator
                     new_positions[vit_start : vit_start + num_vit] = M + 1
 
                     num_post_text = end - post_text_start
