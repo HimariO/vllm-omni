@@ -15,8 +15,9 @@
 #
 # Because this topology does NOT transfer at prefill, stage 0 must be able to
 # actually run the think decode: ``default_sampling_params`` keeps
-# temperature 0.4 / top_p 0.9 / max_tokens 2048 (never clamp max_tokens to a
-# prefill-only value for this pipeline).
+# temperature 0.4 / top_p 0.9 / max_tokens 8192 (mirrors upstream
+# ``max_think_token_n``; never clamp max_tokens to a prefill-only value for
+# this pipeline).
 #
 # Select this topology explicitly via:
 #   vllm serve <SenseNova-Vision-7B-MoT checkpoint> --omni \
@@ -40,12 +41,15 @@ stages:
     enable_prefix_caching: false
     devices: "0"
     default_sampling_params:
-      temperature: 0.4
+      temperature: 0.7
       top_p: 0.9
       top_k: 1
-      max_tokens: 2048
+      max_tokens: 8192
       seed: 52
       detokenize: true
+      # Upstream decodes greedily with NO logit post-processing at all
+      # (Bagel.generate_text -> argmax; no repetition/top_p/top_k anywhere).
+      # top_k=1 + repetition_penalty 1.0 reproduces that exactly.
       repetition_penalty: 1.05
 
   - stage_id: 1
