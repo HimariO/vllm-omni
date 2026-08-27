@@ -24,13 +24,21 @@ stages:
     enable_chunked_prefill: true
     devices: "0"
     default_sampling_params:
-      temperature: 0.4
-      top_p: 0.9
+      # Upstream decode is PURE argmax: Bagel.generate_text uses do_sample=False
+      # (argmax) and NO logit post-processing of any kind (no temperature/top_p/
+      # repetition penalty).  top_k=1 reproduces argmax exactly ONLY when no
+      # other processor mutates the logits, so keep temperature=1.0,
+      # top_p=1.0, repetition_penalty=1.0.  Sampling-side distortion here hit
+      # every text-output modality (detection/gcg_seg collapsed into token-loop
+      # junk once greedy-formatted prompts were fed), while img2text survived by
+      # luck of a strong-mode distribution.
+      temperature: 1.0
+      top_p: 1.0
       top_k: 1
       max_tokens: 8192
       seed: 52
       detokenize: true
-      repetition_penalty: 1.05
+      repetition_penalty: 1.0
 
   - stage_id: 1
     # Must be explicit: unlike BAGEL (whose config.json model_type="bagel"

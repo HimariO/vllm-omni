@@ -41,16 +41,16 @@ stages:
     enable_prefix_caching: false
     devices: "0"
     default_sampling_params:
-      temperature: 0.7
-      top_p: 0.9
+      # Upstream decodes greedily with NO logit post-processing at all
+      # (Bagel.generate_text -> argmax; no temperature/top_p/top_k/repetition
+      # anywhere).  top_k=1 + identity processors reproduce that exactly.
+      temperature: 1.0
+      top_p: 1.0
       top_k: 1
       max_tokens: 8192
       seed: 52
       detokenize: true
-      # Upstream decodes greedily with NO logit post-processing at all
-      # (Bagel.generate_text -> argmax; no repetition/top_p/top_k anywhere).
-      # top_k=1 + repetition_penalty 1.0 reproduces that exactly.
-      repetition_penalty: 1.05
+      repetition_penalty: 1.0
 
   - stage_id: 1
     # Must be explicit: unlike BAGEL (whose config.json model_type="bagel"
