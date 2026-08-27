@@ -128,27 +128,37 @@ def _sensenova_vit_resize_dims(vae_h: int, vae_w: int) -> tuple[int, int]:
 
 
 def _fix_siglip_pos_encoding(embeddings) -> bool:
-    """Bind an upstream-faithful ``interpolate_pos_encoding`` on a live
-    SigLIP embeddings module.
+    """Bind a navit-exact ``interpolate_pos_encoding`` on a live SigLIP
+    embeddings module.
 
-    vLLM's ``SiglipVisionEmbeddings.interpolate_pos_encoding``
-    (vllm/model_executor/models/siglip.py) reads
-    ``self.position_embedding.weight.shape[1]`` -- the HIDDEN size -- when
-    reconstructing the 2-D positional grid, while upstream
-    (``modeling/siglip/modeling_siglip.py``, ``num_positions =
-    weight.shape[0]``) correctly reads the POSITION COUNT.  With the
-    SigLIP-B/400 table being (4900, 1152), any non-square ViT feed sends it
-    through ``sqrt(1152) ~= 33`` and crashes:
-    ``shape '[1, 33, 33, 1152]' is invalid for input of size 5644800``.
-    Square feeds never reach that branch (the early return fires), which is
-    why the fixed 980x980 base path worked and only the aspect-preserving
-    grids broke.
+    TWO bugs are repaired by shadowing the bound method:
 
-    This shadows the bound method with a corrected port of the upstream
-    logic (identical semantics: early-return on square+matching grid,
-    bicubic ``new_height x new_width`` resample otherwise).  Idempotent;
-    returns True when a corrected method is (already) bound, False when the
-    object does not look like SigLIP embeddings.
+    1. vLLM's ``SiglipVisionEmbeddings.interpolate_pos_encoding``
+       (vllm/model_executor/models/siglip.py) reads
+       ``self.position_embedding.weight.shape[1]`` -- the HIDDEN size --
+       when reconstructing the 2-D positional grid; with the SigLIP-B/400
+       table being (4900, 1152) any non-square ViT feed crashes with
+       ``shape '[1, 33, 33, 1152]' invalid for input of size 5644800``
+       (sqrt(1152) ~= 33).  Square feeds never reach that branch (the early
+       return fires), which is why the fixed 980x980 base path worked.
+    2. A corrected BICUBIC resample is STILL wrong for this checkpoint:
+       upstream never interpolates the SigLIP position table.
+       ``modeling/bagel/siglip_navit.py`` (the class the checkpoint ships)
+       does ``patch_embeds + self.position_embedding(
+       packed_flattened_position_ids)`` -- an EXACT-row lookup at ids
+       ``h * 70 + w`` (``get_flattened_position_ids_extrapolate``), so any
+       grid up to 70x70 lands entirely inside the trained 4900-row table,
+       and interpolated/blended rows are OOD inputs the AR never saw
+       (observed: out_13 degraded every img2img modality while
+       understanding stayed healthy).
+
+    The bound replacement therefore performs the navit-exact lookup:
+    ``table[h * grid_side + w]`` for the fed grid (token order matches the
+    conv row-major flattening == upstream ``patchify`` chpwq->hwpqc), with
+    the original early-return retained for exact-square full-grid feeds
+    (both branches produce identical rows there).  Idempotent; raises-
+    free; returns False if the object does not look like SigLIP
+    embeddings.
     """
     pos_embed = getattr(embeddings, "position_embedding", None)
     weight = getattr(pos_embed, "weight", None)
@@ -169,24 +179,29 @@ def _fix_siglip_pos_encoding(embeddings) -> bool:
 
     import types as _types
 
-    def _interpolate_pos_encoding_upstream_faithful(self, emb: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        num_patches = emb.shape[1]
+    def _navit_pos_encoding(self, emb: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Exact-row lookup mirroring siglip_navit.SiglipVisionEmbeddings."""
         table = self.position_embedding.weight  # (num_positions, dim)
-        num_positions, dim = table.shape[0], table.shape[1]
-        if num_patches == num_positions and height == width:
+        num_positions = table.shape[0]
+        grid_side = int(num_positions**0.5)
+        gh, gw = height // self.patch_size, width // self.patch_size
+        if emb.shape[1] == num_positions and height == width and gh * gw == num_positions:
+            # Exact-square full-grid feed: direct lookup and the stock early
+            # return yield the SAME rows; keep the cheap path.
             return self.position_embedding(self.position_ids)
-        new_height = height // self.patch_size
-        new_width = width // self.patch_size
-        sqrt_positions = int(num_positions**0.5)
-        patch_pos = table.unsqueeze(0).reshape(1, sqrt_positions, sqrt_positions, dim)
-        patch_pos = patch_pos.permute(0, 3, 1, 2)
-        patch_pos = torch.nn.functional.interpolate(
-            patch_pos, size=(new_height, new_width), mode="bicubic", align_corners=False
-        )
-        return patch_pos.permute(0, 2, 3, 1).reshape(1, -1, dim)
+        if gh > grid_side or gw > grid_side:
+            raise RuntimeError(
+                f"ViT grid {gh}x{gw} exceeds the learned position table "
+                f"side {grid_side}; the checkpoint has no rows beyond it."
+            )
+        device = table.device
+        h_coords = torch.arange(gh, device=device)
+        w_coords = torch.arange(gw, device=device)
+        pos_ids = (h_coords[:, None] * grid_side + w_coords).reshape(-1)
+        return table[pos_ids].unsqueeze(0)  # (1, gh*gw, dim)
 
     embeddings._sensenova_pos_interp_fixed = True
-    embeddings.interpolate_pos_encoding = _types.MethodType(_interpolate_pos_encoding_upstream_faithful, embeddings)
+    embeddings.interpolate_pos_encoding = _types.MethodType(_navit_pos_encoding, embeddings)
     return True
 
 
@@ -416,11 +431,13 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         - per-image ViT grids that follow aspect ratio (bicubic resize to the
           ``_sensenova_vit_resize_dims`` grid; must stay in lockstep with the
           processor's ``num_vit_patches`` placeholder count);
-        - SigLIP runs with ``interpolate_pos_encoding=True`` so its learned
-          position embeddings are resampled to the actual grid.  vLLM's
-          implementation has a hidden-dim / num-positions mixup that crashes
-          on any non-square feed, so :func:`_fix_siglip_pos_encoding` binds
-          an upstream-faithful replacement first.
+        - SigLIP position rows come from an EXACT table lookup (upstream
+          siglip_navit never interpolates: ids are ``h * 70 + w`` into the
+          trained 4900-row table, so any grid <= 70x70 is fully
+          in-distribution).  vLLM's ``interpolate_pos_encoding`` both has a
+          hidden-dim mixup (crashes on non-square feeds) and would bicubically
+          blend rows -- OOD poison, see out_13 -- so
+          :func:`_fix_siglip_pos_encoding` binds the navit-exact lookup.
         """
         embeddings_module = getattr(getattr(self.vit_model, "vision_model", None), "embeddings", None)
         if not _fix_siglip_pos_encoding(embeddings_module):
