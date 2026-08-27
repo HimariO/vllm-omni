@@ -166,8 +166,18 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
             # prepare_vit_images): each block bracketed by <|vision_start|> ...
             # <|vision_end|>, blocks ADJACENT - no <|fim_middle|> placeholder
             # run and no separator token ever appear in upstream sequences.
-            # The bracket pairs keep the two embed islands distinct for
-            # mm_prefix_range (bidirectional-within-island masking).
+            #
+            # EVERY slot in the expanded block carries an mm embedding,
+            # mirroring upstream, which assigns embed_tokens(start/end_of_image)
+            # to the marker rows and computed VAE-latent / ViT-patch embeddings
+            # to the patch rows (_process_img2img_input builds exactly that
+            # combined tensor). This is REQUIRED for vLLM's engine-side
+            # placement: PlaceholderRange positions are matched to embedding
+            # rows by the RUNNING COUNT of is_embed=True slots, so any False
+            # slot interleaved INSIDE the placeholder shifts every subsequent
+            # embedding onto the wrong token (observed GPU-wide corruption in
+            # out_10 with marker rows marked False). all-True keeps the
+            # position->row identity mapping exact.
             start_of_image_id = tokenizer.get_vocab()["<|vision_start|>"]
             end_of_image_id = tokenizer.get_vocab()["<|vision_end|>"]
             tokens = (
@@ -179,11 +189,7 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
                 + [end_of_image_id]
             )
 
-            embed_mask = [False] + [True] * num_vae_patches + [False] + [False] + [True] * num_vit_patches + [False]
-            return PromptUpdateDetails(
-                full=tokens,
-                is_embed=lambda _tok, _seq, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
-            )
+            return PromptUpdateDetails.from_seq(tokens)
 
         # Replace the img2img placeholder update (by modality) with the
         # resized version; keep everything else the base produced.
