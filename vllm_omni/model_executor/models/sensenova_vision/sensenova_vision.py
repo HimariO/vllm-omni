@@ -404,11 +404,12 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             self._ropes_pending.clear()
 
         # Upstream runs the ViT transform on the VAE-transformed image
-        # (inferencer.update_context_image); do the same here.
-        vit_input = torch.empty_like(pixel_values)
-        for i in range(num_images):
-            vit_input[i] = self._resize_to_stride(pixel_values[i : i + 1])[0]
-        vit_embeddings_tuple = self._encode_vit_embeddings(vit_input)
+        # (inferencer.update_context_image); do the same here.  _encode_
+        # vit_embeddings handles its own ViT-grid sizing per image -- never
+        # assume a fixed buffer shape equal to the raw input (profile-run
+        # dummies disagree) nor a uniform aspect ratio across the batch.
+        vae_resized = [self._resize_to_stride(pixel_values[i : i + 1]) for i in range(num_images)]
+        vit_embeddings_tuple = tuple(emb for pv in vae_resized for emb in self._encode_vit_embeddings(pv))
 
         marker_ids = torch.tensor(
             [self._start_of_image_id, self._end_of_image_id],
