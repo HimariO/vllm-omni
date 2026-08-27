@@ -43,6 +43,16 @@ SENSENOVA_VISION_VAE_MAX_SIZE = 1024
 SENSENOVA_VISION_VAE_MIN_SIZE = 512
 SENSENOVA_VISION_VAE_STRIDE = 16
 
+# Official SenseNova-Vision ViT image transform (``ImageTransform(980, 224, 14)``):
+# aspect-PRESERVING ``MaxLongEdgeMinShortEdgeResize`` -- long edge <= 980, short
+# edge >= 224, rounded to stride 14, pixel budget 14*14*9*1024/img.  Upstream
+# runs this on the VAE-resized image inside ``update_context_image``, so the
+# ViT patch count FOLLOWS the aspect ratio instead of being a fixed square.
+SENSENOVA_VISION_VIT_MAX_SIZE = 980
+SENSENOVA_VISION_VIT_MIN_SIZE = 224
+SENSENOVA_VISION_VIT_STRIDE = 14
+SENSENOVA_VISION_VIT_MAX_PIXELS = 14 * 14 * 9 * 1024
+
 
 def _sensenova_vae_resize_dims(img_h: int, img_w: int) -> tuple[int, int]:
     """Stride-aligned ``(new_h, new_w)`` for the SenseNova-Vision VAE transform.
@@ -76,6 +86,46 @@ RECON3D_VAE_SIDE = 512
 # ``num_output_vae`` in upstream ``gen_image`` (inferencer.py) when no explicit
 # per-request ``num_views`` is supplied.
 RECON3D_DEFAULT_NUM_VIEWS = 4
+
+
+def _sensenova_make_divisible(value: int, stride: int) -> int:
+    """Mirror ``MaxLongEdgeMinShortEdgeResize._make_divisible``."""
+    return max(stride, int(round(value / stride)) * stride)
+
+
+def _sensenova_vit_resize_dims(vae_h: int, vae_w: int) -> tuple[int, int]:
+    """Stride-aligned ``(vit_h, vit_w)`` for ``ImageTransform(980, 224, 14)``.
+
+    Ports ``MaxLongEdgeMinShortEdgeResize`` for the ViT branch (bicubic,
+    antialias default), including the max-pixels shrink and the final
+    longest-edge cap.  Input is the ALREADY-VAE-RESIZED image, matching
+    upstream ``interleave_inference`` (the ViT transform is applied to the
+    vae-transformed image).  Must be kept in lockstep with
+    ``_process_img2img_input`` so the placeholder count equals the patch
+    count.
+    """
+    max_size = SENSENOVA_VISION_VIT_MAX_SIZE
+    min_size = SENSENOVA_VISION_VIT_MIN_SIZE
+    stride = SENSENOVA_VISION_VIT_STRIDE
+
+    def apply_scale(width: int, height: int, scale: float) -> tuple[int, int]:
+        return (
+            _sensenova_make_divisible(round(width * scale), stride),
+            _sensenova_make_divisible(round(height * scale), stride),
+        )
+
+    scale = min(max_size / max(vae_h, vae_w), 1.0)
+    scale = max(scale, min_size / min(vae_h, vae_w))
+    vit_w, vit_h = apply_scale(vae_w, vae_h, scale)
+
+    if vit_w * vit_h > SENSENOVA_VISION_VIT_MAX_PIXELS:
+        shrink = SENSENOVA_VISION_VIT_MAX_PIXELS / (vit_w * vit_h)
+        vit_w, vit_h = apply_scale(vit_w, vit_h, shrink)
+    if max(vit_w, vit_h) > max_size:
+        shrink = max_size / max(vit_w, vit_h)
+        vit_w, vit_h = apply_scale(vit_w, vit_h, shrink)
+    return vit_h, vit_w
+
 
 # SenseNova-Vision-7B-MoT defaults.  The checkpoint ships metadata-only
 # ``config.json`` (no ``architectures``), so these constants mirror what the
@@ -144,24 +194,28 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
             return replacements
 
         hf_config = self.info.get_hf_config()
-        vit_config = hf_config.vit_config
-        image_size = vit_config.image_size
-        num_vit_patches = (image_size // vit_config.patch_size) ** 2
 
         latent_patch_size = getattr(hf_config, "latent_patch_size", 2)
         downsample = hf_config.vae_config.get("downsample", 8)
         latent_downsample = downsample * latent_patch_size
 
         def get_img2img_replacement(item_idx: int):
-            h, w = image_size, image_size
+            h, w = SENSENOVA_VISION_VIT_MAX_SIZE, SENSENOVA_VISION_VIT_MAX_SIZE
             if "img2img" in mm_items:
                 item = mm_items.get_items("img2img", (Img2ImgProcessorItems, ImageEmbeddingItems))
                 if hasattr(item, "get_image_size"):
                     size = item.get_image_size(item_idx)
                     h, w = size.height, size.width
 
+            # Two-stage official transform: VAE resize first, then the ViT
+            # transform applied to the VAE-RESIZED image (upstream
+            # interleave_inference L325 + update_context_image). Both stages
+            # are aspect-preserving; the ViT patch count follows the aspect
+            # ratio (capped at 4900 = 70x70, never exceeds the old square).
             new_h, new_w = _sensenova_vae_resize_dims(int(h), int(w))
+            vit_h, vit_w = _sensenova_vit_resize_dims(new_h, new_w)
             num_vae_patches = (new_h // latent_downsample) * (new_w // latent_downsample)
+            num_vit_patches = (vit_h // SENSENOVA_VISION_VIT_STRIDE) * (vit_w // SENSENOVA_VISION_VIT_STRIDE)
             # Upstream-exact layout (Bagel prepare_vae_images /
             # prepare_vit_images): each block bracketed by <|vision_start|> ...
             # <|vision_end|>, blocks ADJACENT - no <|fim_middle|> placeholder
@@ -286,6 +340,127 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
                 pixel_values, size=(new_H, new_W), mode="bicubic", align_corners=False
             )
         return pixel_values
+
+    def _encode_vit_embeddings(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Encode img2img images through the ViT with upstream sizing.
+
+        Upstream applies ``ImageTransform(980, 224, 14)`` -- an ASPECT-
+        PRESERVING resize -- to the VAE-resized image before the ViT, so the
+        patch count follows the aspect ratio instead of being a fixed square
+        (the vLLM-core base resizes to ``image_size x image_size`` and emits
+        exactly 70x70 patches).  This changes two things vs the base:
+
+        - per-image ViT grids that follow aspect ratio (bicubic resize to the
+          ``_sensenova_vit_resize_dims`` grid; must stay in lockstep with the
+          processor's ``num_vit_patches`` placeholder count);
+        - SigLIP runs with ``interpolate_pos_encoding=True`` so its learned
+          position embeddings are resampled to the actual grid (supported by
+          vLLM's SiglipVisionModel.forward).
+        """
+        vit_embeds = []
+        for i in range(pixel_values.shape[0]):
+            single_pv = pixel_values[i : i + 1]
+            H, W = single_pv.shape[2:]
+            vit_h, vit_w = _sensenova_vit_resize_dims(H, W)
+            if (vit_h, vit_w) != (H, W):
+                single_pv = torch.nn.functional.interpolate(
+                    single_pv, size=(vit_h, vit_w), mode="bicubic", align_corners=False
+                )
+            features = self.vit_model(single_pv, interpolate_pos_encoding=True)
+            embed = self.connector(features)
+            num_patches = embed.shape[1]
+            hidden = embed.shape[2]
+            ph = self.config.vit_config.patch_size
+            h_coords = torch.arange(vit_h // ph, device=embed.device)
+            w_coords = torch.arange(vit_w // ph, device=embed.device)
+            position_ids = (h_coords[:, None] * self.config.vit_max_num_patch_per_side + w_coords).flatten()
+            position_ids = position_ids.unsqueeze(0).expand(1, -1).flatten()
+            pos_embeds = self.vit_pos_embed(position_ids)
+            pos_embeds = pos_embeds.reshape(1, num_patches, hidden)
+            vit_embeds.append(embed + pos_embeds.to(embed.device))
+        return tuple(vit_embeds)
+
+    def _process_img2img_input(self, multimodal_input):
+        """Base img2img embedding, but ViT-encoded at upstream sizing.
+
+        The vLLM-core ``_process_img2img_input`` bicubically squashes the ViT
+        feed to a fixed 980x980 square (70x70 = 4900 patches regardless of
+        aspect) and its core ``_process_image_input`` builds the pos-ids grid
+        from ``image_size // patch_size``.  Upstream instead applies
+        ``ImageTransform(980, 224, 14)`` to the VAE-resized image, so patch
+        count follows aspect ratio.  This method replicates the base flow but
+        swaps the ViT encoding for :meth:`_encode_vit_embeddings`.
+        """
+        pixel_values = multimodal_input["pixel_values"]
+        if pixel_values.ndim == 5:
+            b, n, c, h, w = pixel_values.shape
+            pixel_values = pixel_values.reshape(b * n, c, h, w)
+
+        num_images = pixel_values.shape[0]
+        p = self.latent_patch_size
+        timestep = 0
+
+        if self._ropes_pending:
+            self._ropes_pending.clear()
+
+        # Upstream runs the ViT transform on the VAE-transformed image
+        # (inferencer.update_context_image); do the same here.
+        vit_input = torch.empty_like(pixel_values)
+        for i in range(num_images):
+            vit_input[i] = self._resize_to_stride(pixel_values[i : i + 1])[0]
+        vit_embeddings_tuple = self._encode_vit_embeddings(vit_input)
+
+        marker_ids = torch.tensor(
+            [self._start_of_image_id, self._end_of_image_id],
+            device=pixel_values.device,
+            dtype=torch.long,
+        )
+        marker_embeds = self.language_model.model.embed_tokens(marker_ids)
+        start_embed = marker_embeds[0:1]
+        end_embed = marker_embeds[1:2]
+
+        results = []
+        for i in range(num_images):
+            single_pv = pixel_values[i : i + 1]
+            single_pv = self._resize_to_stride(single_pv)
+            H, W = single_pv.shape[2:]
+
+            padded_latent = self.vae.encode(single_pv)
+            h = H // self.latent_downsample
+            w = W // self.latent_downsample
+
+            latent = padded_latent[0][:, : h * p, : w * p]
+            latent = latent.reshape(self.latent_channel, h, p, w, p)
+            latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
+
+            vae_position_ids = self.get_flattened_position_ids(
+                H,
+                W,
+                self.latent_downsample,
+                max_num_patches_per_side=self.max_latent_size,
+            )
+            pos_embed = self.latent_pos_embed([vae_position_ids])
+            packed_timesteps = torch.tensor([timestep], device=padded_latent.device)
+            with torch.amp.autocast(self.device.type, dtype=torch.bfloat16):
+                timestep_embeds = self.time_embedder(packed_timesteps.to(padded_latent))
+            vae_embeds = self.vae2llm(latent) + timestep_embeds + pos_embed
+
+            vit_emb_full = vit_embeddings_tuple[i] if i < len(vit_embeddings_tuple) else vit_embeddings_tuple[0]
+            # _encode_vit_embeddings yields (1, N, hidden); drop the batch dim.
+            vit_emb = vit_emb_full.reshape(-1, vit_emb_full.shape[-1])
+
+            se = start_embed.to(vae_embeds.dtype)
+            ee = end_embed.to(vae_embeds.dtype)
+            combined = torch.cat([se, vae_embeds, ee, se, vit_emb, ee], dim=0)
+            results.append(combined)
+
+            num_vae = h * w + 2  # +2 for start/end markers
+            num_vit = vit_emb.shape[0] + 2
+            info = (num_vae, num_vit, int(H), int(W))
+            self._pending_img2img_info.append(info)
+            self._last_img2img_info = info
+
+        return tuple(results)
 
     def forward(
         self,
