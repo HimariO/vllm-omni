@@ -127,6 +127,69 @@ def _sensenova_vit_resize_dims(vae_h: int, vae_w: int) -> tuple[int, int]:
     return vit_h, vit_w
 
 
+def _fix_siglip_pos_encoding(embeddings) -> bool:
+    """Bind an upstream-faithful ``interpolate_pos_encoding`` on a live
+    SigLIP embeddings module.
+
+    vLLM's ``SiglipVisionEmbeddings.interpolate_pos_encoding``
+    (vllm/model_executor/models/siglip.py) reads
+    ``self.position_embedding.weight.shape[1]`` -- the HIDDEN size -- when
+    reconstructing the 2-D positional grid, while upstream
+    (``modeling/siglip/modeling_siglip.py``, ``num_positions =
+    weight.shape[0]``) correctly reads the POSITION COUNT.  With the
+    SigLIP-B/400 table being (4900, 1152), any non-square ViT feed sends it
+    through ``sqrt(1152) ~= 33`` and crashes:
+    ``shape '[1, 33, 33, 1152]' is invalid for input of size 5644800``.
+    Square feeds never reach that branch (the early return fires), which is
+    why the fixed 980x980 base path worked and only the aspect-preserving
+    grids broke.
+
+    This shadows the bound method with a corrected port of the upstream
+    logic (identical semantics: early-return on square+matching grid,
+    bicubic ``new_height x new_width`` resample otherwise).  Idempotent;
+    returns True when a corrected method is (already) bound, False when the
+    object does not look like SigLIP embeddings.
+    """
+    pos_embed = getattr(embeddings, "position_embedding", None)
+    weight = getattr(pos_embed, "weight", None)
+    if (
+        weight is None
+        or weight.ndim != 2
+        or not hasattr(embeddings, "patch_size")
+        or not torch.is_tensor(getattr(embeddings, "position_ids", None))
+        or not callable(getattr(embeddings, "interpolate_pos_encoding", None))
+    ):
+        return False
+    if getattr(embeddings, "_sensenova_pos_interp_fixed", False):
+        return True
+    grid = int(weight.shape[0] ** 0.5)
+    if grid * grid != weight.shape[0]:
+        # Not a square position table (never true for SigLIP); leave alone.
+        return False
+
+    import types as _types
+
+    def _interpolate_pos_encoding_upstream_faithful(self, emb: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        num_patches = emb.shape[1]
+        table = self.position_embedding.weight  # (num_positions, dim)
+        num_positions, dim = table.shape[0], table.shape[1]
+        if num_patches == num_positions and height == width:
+            return self.position_embedding(self.position_ids)
+        new_height = height // self.patch_size
+        new_width = width // self.patch_size
+        sqrt_positions = int(num_positions**0.5)
+        patch_pos = table.unsqueeze(0).reshape(1, sqrt_positions, sqrt_positions, dim)
+        patch_pos = patch_pos.permute(0, 3, 1, 2)
+        patch_pos = torch.nn.functional.interpolate(
+            patch_pos, size=(new_height, new_width), mode="bicubic", align_corners=False
+        )
+        return patch_pos.permute(0, 2, 3, 1).reshape(1, -1, dim)
+
+    embeddings._sensenova_pos_interp_fixed = True
+    embeddings.interpolate_pos_encoding = _types.MethodType(_interpolate_pos_encoding_upstream_faithful, embeddings)
+    return True
+
+
 # SenseNova-Vision-7B-MoT defaults.  The checkpoint ships metadata-only
 # ``config.json`` (no ``architectures``), so these constants mirror what the
 # official ``SenseNovaVisionModel._build_model`` applies at load time
@@ -354,9 +417,17 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
           ``_sensenova_vit_resize_dims`` grid; must stay in lockstep with the
           processor's ``num_vit_patches`` placeholder count);
         - SigLIP runs with ``interpolate_pos_encoding=True`` so its learned
-          position embeddings are resampled to the actual grid (supported by
-          vLLM's SiglipVisionModel.forward).
+          position embeddings are resampled to the actual grid.  vLLM's
+          implementation has a hidden-dim / num-positions mixup that crashes
+          on any non-square feed, so :func:`_fix_siglip_pos_encoding` binds
+          an upstream-faithful replacement first.
         """
+        embeddings_module = getattr(getattr(self.vit_model, "vision_model", None), "embeddings", None)
+        if not _fix_siglip_pos_encoding(embeddings_module):
+            raise RuntimeError(
+                "Could not locate SiglipVisionEmbeddings on vit_model; "
+                "aspect-preserving ViT grids require the pos-encoding fix."
+            )
         vit_embeds = []
         for i in range(pixel_values.shape[0]):
             single_pv = pixel_values[i : i + 1]
