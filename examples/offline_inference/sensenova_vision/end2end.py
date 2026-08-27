@@ -148,7 +148,26 @@ _IM_END = "<|im_end|>"
 _FIM_MIDDLE = "<|fim_middle|>"
 _IMAGE_PAD_BLOCK = "<|image_pad|>\n"
 # Understanding tasks continue after an opened assistant turn.
+# NOTE: only TRUE understanding-mode sequences may carry this suffix. Upstream
+# pack_sequence/prepare_prompts wrap every text segment as
+# [<|im_start|>] ids [<|im_end|>] and NEVER emit an assistant role opener, so
+# appending {_IM_END}{_IM_START}assistant\n behind an already-EOS-terminated
+# scaffold puts {prompt}<|im_end|><|im_start|>assistant\n INSIDE a segment the
+# AR treats as chat context -- out-of-distribution for the checkpoint.
 _UNDERSTANDING_SUFFIX = f"{_IM_END}\n{_IM_START}assistant\n"
+
+
+def _official_text(prompt: str) -> str:
+    """Official prompt text after upstream ``generate()``'s ``<image>`` split.
+
+    Upstream ``generate`` splits the question on ``<image>`` and enqueues each
+    non-empty stripped part verbatim as a text segment; the port's scaffold
+    carries the image separately, so ``<image>`` is simply dropped here --
+    everything AFTER it passes through BYTE-FOR-BYTE (including trailing '?')
+    exactly as upstream ``update_context_text`` sees it.
+    """
+    return prompt.replace("<image>", "").strip()
+
 
 # ``--modality`` choices and the SenseNovaVision pipeline mode they map to.
 # The ``think-*`` entries require the ``sensenova_vision_think`` topology
@@ -315,7 +334,7 @@ def _format_text2text_prompts(prompts):
 def _format_img2text_prompts(prompts, image):
     return [
         {
-            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{p}{_UNDERSTANDING_SUFFIX}",
+            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{_official_text(p)}{_UNDERSTANDING_SUFFIX}",
             "multi_modal_data": {"image": image},
             "modalities": ["text"],
             "mode": "understanding",
@@ -327,7 +346,7 @@ def _format_img2text_prompts(prompts, image):
 def _format_dense_detection_prompts(prompts, image):
     return [
         {
-            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{p}{_UNDERSTANDING_SUFFIX}",
+            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{_official_text(p)}{_UNDERSTANDING_SUFFIX}",
             "multi_modal_data": {"image": image},
             "modalities": ["text"],
             "mode": "dense_detection",
@@ -339,7 +358,7 @@ def _format_dense_detection_prompts(prompts, image):
 def _format_dense_ocr_prompts(prompts, image):
     return [
         {
-            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{p}{_UNDERSTANDING_SUFFIX}",
+            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{_official_text(p)}{_UNDERSTANDING_SUFFIX}",
             "multi_modal_data": {"image": image},
             "modalities": ["text"],
             "mode": "dense_OCR",
@@ -432,12 +451,17 @@ def _format_mixed_prompts(prompts, image):
     # degenerates to dot-fills (sampling after EOS is off-distribution);
     # a full "assistant" turn truncates early (role words are OOD); NO opener
     # at all degenerates to token loops.  Role words/newlines stay out.
-    # Also strip the official ``<image>`` placeholder: upstream generate()
-    # splits questions on it before tokenization (never reaches the model);
-    # the image rides on multi_modal_data["img2img"] here.
+    #
+    # Prompt text parity: upstream generate() splits the question on
+    # ``<image>`` and enqueues every non-empty part VERBATIM (byte-for-byte,
+    # trailing '?' included) via update_context_text.  The caption template's
+    # post-<image> text IS 'Please briefly describe ... in the answer.';
+    # feeding a shortened paraphrase or stripping punctuation yields prompts
+    # outside the training distribution of the <p>/<color> instrumented
+    # captions, which corrupts the interleaved conditioning the DiT relies on.
     return [
         {
-            "prompt": (f"{_FIM_MIDDLE}{_IM_START}{p.replace('<image>', '').strip()}{_IM_END}{_IM_START}"),
+            "prompt": (f"{_FIM_MIDDLE}{_IM_START}{_official_text(p)}{_IM_END}{_IM_START}"),
             "multi_modal_data": {"img2img": image},
             "modalities": ["img2img"],
             "mode": "caption_generate",
