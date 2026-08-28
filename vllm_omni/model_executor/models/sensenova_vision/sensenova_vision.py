@@ -588,7 +588,10 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
 
         vae_resized = [self._resize_to_stride(pixel_values[i : i + 1]) for i in range(num_images)]
         vit_embeddings = [emb for pv in vae_resized for emb in self._encode_vit_embeddings(pv)]
-        return tuple(vit_embeddings)
+        # _encode_vit_embeddings yields (1, N, hidden) per image; the engine's
+        # sanity_check_mm_encoder_outputs requires 2D (N, hidden) embeddings
+        # (the same shape the img2img path returns), so drop the batch dim.
+        return tuple(e.reshape(-1, e.shape[-1]) for e in vit_embeddings)
 
     def _process_img2img_input(self, multimodal_input):
         """Base img2img embedding, but ViT-encoded at upstream sizing.
