@@ -245,6 +245,14 @@ class OmniSenseNovaVisionProcessor(OmniBagelProcessor):
     with ``_process_img2text_input``.
     """
 
+    # transformers>=5.0 ProcessorMixin.get_attributes() only scans the LEAF
+    # class's __dict__ for ``<attribute>_class`` hints. Since this class is
+    # what from_pretrained() instantiates, redeclare the hints so
+    # ``self.image_processor`` / ``self.tokenizer`` are set (the parent
+    # OmniBagelProcessor redeclarations are invisible to the leaf scan).
+    image_processor_class = "SiglipImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+
     def __call__(self, text=None, images=None, **kwargs):
         is_img2img = kwargs.pop("is_img2img", False)
         if images is not None and not is_img2img:
