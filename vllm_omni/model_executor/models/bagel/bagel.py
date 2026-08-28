@@ -228,37 +228,33 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
         # (e.g. serving_chat) can stay model-agnostic.
         return {k: v for k, v in mm_kwargs.items() if k not in ("target_h", "target_w")}
 
-    def _apply_hf_processor(self, inputs, timing_ctx):
-        # Parity guard for the caption_generate (mixed) decode loop: log the
-        # exact token ids that enter the AR prefill so GPU runs can verify the
-        # bos-opener scaffold survives processing (expected tail for mixed:
-        # ... {prompt} <|im_end|> <|im_start|>  — sampling resumes from the
-        # trailing bare <|im_start|>, mirroring upstream prepare_start_tokens).
-        # vLLM returns (prompt_ids, MultiModalProcessingInfo, is_update_applied).
-        prompt_ids, _mm_info, _updated = super()._apply_hf_processor(inputs, timing_ctx)
-        try:
-            if inputs.mm_data_items.get_all_counts().get("img2img", 0) > 0:
-                ids = list(prompt_ids)
-                tok = self.info.get_tokenizer()
-                head = tok.decode(ids[:16])
-                tail = tok.decode(ids[-16:])
-                logger.info(
-                    "BAGEL AR prompt tokens: len=%d head=%r tail=%r",
-                    len(ids),
-                    head,
-                    tail,
-                )
-        except Exception:
-            # Never break serving on the probe, but DO surface why it skipped.
-            logger.warning("BAGEL AR prompt-token probe failed", exc_info=True)
-        return prompt_ids, _mm_info, _updated
-
     def _cached_apply_hf_processor(self, inputs, timing_ctx):
         # img2img: prompt text must be modified based on mm data presence,
         # so text and mm data cannot be tokenized separately — bypass cache.
         if inputs.mm_data_items.get_all_counts().get("img2img", 0) > 0:
-            return self._apply_hf_processor(inputs, timing_ctx)
-        return super()._cached_apply_hf_processor(inputs, timing_ctx)
+            prompt_ids, _mm_info, _updated = self._apply_hf_processor(inputs, timing_ctx)
+        else:
+            prompt_ids, _mm_info, _updated = super()._cached_apply_hf_processor(inputs, timing_ctx)
+
+        try:
+            ids = list(prompt_ids)
+            tok = self.info.get_tokenizer()
+            head = tok.decode(ids[:32])
+            tail = tok.decode(ids[-32:])
+            logger.info(
+                "BAGEL AR prompt tokens: len=%d head=%r tail=%r",
+                len(ids),
+                head,
+                tail,
+            )
+            logger.info(
+                f"BAGEL AR prompt tokens: {tok.decode(ids)}",
+            )
+        except Exception:
+            # Never break serving on the probe, but DO surface why it skipped.
+            logger.warning("BAGEL AR prompt-token probe failed", exc_info=True)
+
+        return prompt_ids, _mm_info, _updated
 
     def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
         return {
