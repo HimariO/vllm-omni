@@ -13,18 +13,19 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import torch
+from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargsItems
-from vllm.multimodal.parse import ImageEmbeddingItems, MultiModalDataItems
+from vllm.multimodal.parse import ImageEmbeddingItems, ImageProcessorItems, MultiModalDataItems
 from vllm.multimodal.processing import PromptReplacement, PromptUpdateDetails
 
 from vllm_omni.model_executor.models.bagel.bagel import (
-    Img2ImgProcessorItems,
     OmniBagelDummyInputsBuilder,
     OmniBagelForConditionalGeneration,
     OmniBagelMultiModalProcessor,
     OmniBagelProcessingInfo,
+    OmniBagelProcessor,
 )
 
 # Official SenseNova-Vision VAE image transform, transcribed from the upstream
@@ -218,6 +219,67 @@ SENSENOVA_VISION_DEFAULT_MAX_LATENT_SIZE = 64
 SENSENOVA_VISION_DEFAULT_VIT_MAX_NUM_PATCH_PER_SIDE = 70
 
 
+def _sensenova_vit_patch_count(img_h: int, img_w: int) -> int:
+    """Aspect-aware ViT patch count for an input image at original resolution.
+
+    Mirrors the model-side embedding chain (``_resize_to_stride`` then
+    ``_sensenova_vit_resize_dims``) so the processor's ``image`` / ``img2img``
+    placeholder token counts exactly equal the number of embedding rows the AR
+    model produces (VAE resize first, then the ViT transform applied to the
+    VAE-resized image, matching upstream ``InterleaveInferencer``).
+    """
+    vae_h, vae_w = _sensenova_vae_resize_dims(int(img_h), int(img_w))
+    vit_h, vit_w = _sensenova_vit_resize_dims(vae_h, vae_w)
+    return (vit_h // SENSENOVA_VISION_VIT_STRIDE) * (vit_w // SENSENOVA_VISION_VIT_STRIDE)
+
+
+class OmniSenseNovaVisionProcessor(OmniBagelProcessor):
+    """SenseNovaVision image processor: pass original-res pixels to the AR model.
+
+    Upstream ``InterleaveInferencer.interleave_inference`` resizes the ORIGINAL
+    image with the VAE transform (``ImageTransform(1024, 512, 16)``) before the
+    ViT transform, and never squashes it to a fixed square.  The base
+    ``OmniBagelProcessor`` disables ``do_resize`` for the ``img2img`` modality;
+    SenseNovaVision needs the same for the plain ``image`` (understanding)
+    modality so the patch count follows the aspect ratio and stays in lockstep
+    with ``_process_img2text_input``.
+    """
+
+    def __call__(self, text=None, images=None, **kwargs):
+        is_img2img = kwargs.pop("is_img2img", False)
+        if images is not None and not is_img2img:
+            # Raw (aspect-preserving) pixels: no square pre-resize.  Mirror the
+            # base img2img raw branch; the orchestrating ``_call_hf_processor``
+            # keeps the image/img2img key names distinct.
+            from vllm.transformers_utils.processors.bagel import BagelProcessorKwargs
+
+            output_kwargs = self._merge_kwargs(
+                BagelProcessorKwargs,
+                tokenizer_init_kwargs=self.tokenizer.init_kwargs,
+                **kwargs,
+            )
+            image_kwargs = dict(output_kwargs["images_kwargs"])
+            image_kwargs["do_resize"] = False
+            image_kwargs["do_rescale"] = True
+            image_kwargs.setdefault("return_tensors", "pt")
+            pixel_values = self.image_processor(images, **image_kwargs)
+
+            text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"]) if text is not None else None
+
+            if pixel_values is not None and text_inputs is not None:
+                combined = dict(text_inputs)
+                combined["pixel_values"] = pixel_values["pixel_values"]
+                return BatchFeature(combined)
+            elif pixel_values is not None:
+                return pixel_values
+            elif text_inputs is not None:
+                return BatchFeature(dict(text_inputs))
+            else:
+                return BatchFeature({})
+
+        return super().__call__(text, images, is_img2img=is_img2img, **kwargs)
+
+
 class OmniSenseNovaVisionProcessingInfo(OmniBagelProcessingInfo):
     """Multi-modal limits for SenseNova-Vision.
 
@@ -229,6 +291,11 @@ class OmniSenseNovaVisionProcessingInfo(OmniBagelProcessingInfo):
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": 10, "img2img": 10}
+
+    def get_hf_processor(self, **kwargs: object):
+        # Raw (aspect-preserving) pixels for BOTH image and img2img modalities
+        # so the AR model can apply the official VAE->ViT resize chain.
+        return self.ctx.get_hf_processor(OmniSenseNovaVisionProcessor, **kwargs)
 
 
 class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
@@ -270,6 +337,7 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
         img2img_token_id = tokenizer.get_vocab().get("<|fim_middle|>")
         if img2img_token_id is None:
             return replacements
+        image_token_id = tokenizer.get_vocab().get("<|image_pad|>")
 
         hf_config = self.info.get_hf_config()
 
@@ -277,13 +345,24 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
         downsample = hf_config.vae_config.get("downsample", 8)
         latent_downsample = downsample * latent_patch_size
 
-        def get_img2img_replacement(item_idx: int):
-            h, w = SENSENOVA_VISION_VIT_MAX_SIZE, SENSENOVA_VISION_VIT_MAX_SIZE
-            if "img2img" in mm_items:
-                item = mm_items.get_items("img2img", (Img2ImgProcessorItems, ImageEmbeddingItems))
-                if hasattr(item, "get_image_size"):
+        # Original input image size for a given item (width/height in original
+        # pixel space, before any resize). Falls back to the ViT max square.
+        def _img_size(item_idx: int, modality: str):
+            item = mm_items.get_items(modality, (ImageProcessorItems, ImageEmbeddingItems))
+            if hasattr(item, "get_image_size"):
+                try:
                     size = item.get_image_size(item_idx)
-                    h, w = size.height, size.width
+                    return int(size.height), int(size.width)
+                except Exception:
+                    pass
+            return SENSENOVA_VISION_VIT_MAX_SIZE, SENSENOVA_VISION_VIT_MAX_SIZE
+
+        def get_image_replacement(item_idx: int):
+            h, w = _img_size(item_idx, "image")
+            return [image_token_id] * _sensenova_vit_patch_count(h, w)
+
+        def get_img2img_replacement(item_idx: int):
+            h, w = _img_size(item_idx, "img2img")
 
             # Two-stage official transform: VAE resize first, then the ViT
             # transform applied to the VAE-RESIZED image (upstream
@@ -323,11 +402,17 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
 
             return PromptUpdateDetails.from_seq(tokens)
 
-        # Replace the img2img placeholder update (by modality) with the
-        # resized version; keep everything else the base produced.
+        # Replace the image (img2text) and img2img placeholder updates with
+        # aspect-aware resized versions; keep everything else the base produced.
         out: list[PromptReplacement] = []
         for r in replacements:
-            if r.modality == "img2img":
+            if r.modality == "image":
+                r = PromptReplacement(
+                    modality="image",
+                    target=[image_token_id],
+                    replacement=get_image_replacement,
+                )
+            elif r.modality == "img2img":
                 r = PromptReplacement(
                     modality="img2img",
                     target=[img2img_token_id],
@@ -467,6 +552,35 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             pos_embeds = pos_embeds.reshape(1, num_patches, hidden)
             vit_embeds.append(embed + pos_embeds.to(embed.device))
         return tuple(vit_embeds)
+
+    def _process_img2text_input(self, multimodal_input):
+        """Base img2text (understanding) embedding, but with upstream sizing.
+
+        The vLLM-core ``_process_image_input`` feeds the SigLIP a fixed
+        ``image_size x image_size`` square (980x980 -> 70x70 = 4900 patches)
+        and builds the pos-ids grid from ``image_size // patch_size``.  Upstream
+        instead runs the VAE transform then the ViT transform on the ORIGINAL
+        image, so the patch count follows the aspect ratio (no VAE latent
+        encoding for understanding).  This mirrors the img2img path: VAE-resize
+        per image, then :meth:`_encode_vit_embeddings` (which applies the ViT
+        resize internally and the navit-exact SigLIP pos encoding).
+
+        The returned per-image embeddings must contain exactly one row per
+        ``<|image_pad|>`` placeholder token (``_sensenova_vit_patch_count``),
+        matching the processor's aspect-aware placeholder sizing.
+        """
+        pixel_values = multimodal_input["pixel_values"]
+        if pixel_values.ndim == 5:
+            b, n, c, h, w = pixel_values.shape
+            pixel_values = pixel_values.reshape(b * n, c, h, w)
+
+        num_images = pixel_values.shape[0]
+        if self._ropes_pending:
+            self._ropes_pending.clear()
+
+        vae_resized = [self._resize_to_stride(pixel_values[i : i + 1]) for i in range(num_images)]
+        vit_embeddings = [emb for pv in vae_resized for emb in self._encode_vit_embeddings(pv)]
+        return tuple(vit_embeddings)
 
     def _process_img2img_input(self, multimodal_input):
         """Base img2img embedding, but ViT-encoded at upstream sizing.

@@ -689,8 +689,11 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         if not mm_input_by_modality:
             return None
         multimodal_embeddings: tuple[torch.Tensor, ...] = ()
+        logger.debug(f"[BAGEL embed_multimodal] embed_multimodal {kwargs=}")
 
         for modality in mm_input_by_modality:
+            logger.debug(f"[BAGEL embed_multimodal] embed_multimodal {modality=}")
+
             multimodal_input = mm_input_by_modality[modality]
             if modality == "img2text":
                 image_embeddings = self._process_img2text_input(multimodal_input)
