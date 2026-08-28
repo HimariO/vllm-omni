@@ -18,13 +18,13 @@ stages:
     enable_chunked_prefill: true
     devices: "0"
     default_sampling_params:
-      temperature: 0.4
+      temperature: 0.1
       top_p: 0.9
       top_k: 1
-      max_tokens: 2048
+      max_tokens: 8192
       seed: 52
       detokenize: true
-      repetition_penalty: 1.05
+      repetition_penalty: 1.03
 
   - stage_id: 1
     max_num_batched_tokens: 10000
