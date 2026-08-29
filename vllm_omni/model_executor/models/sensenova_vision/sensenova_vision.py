@@ -470,6 +470,14 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         config = vllm_config.model_config.hf_config
         self._apply_sensenova_vision_config_defaults(config)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # Token id of the plain understanding image placeholder.  The base
+        # derives the vision-marker / fim ids from the registered tokenizer;
+        # the understanding path needs this id for the position rewrite.
+        tok = getattr(self, "_probe_tokenizer", None) or getattr(self, "tokenizer", None)
+        if tok is not None:
+            self._img2text_token_id = int(tok.convert_tokens_to_ids("<|image_pad|>"))
+        else:
+            self._img2text_token_id = -1
 
     @staticmethod
     def _apply_sensenova_vision_config_defaults(config) -> None:
@@ -691,6 +699,11 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         ``_get_prompt_updates`` above): the BAGEL base assumes a legacy
         ``<|fim_middle|>`` separator between the VAE and ViT sections that
         upstream sequences never contain.
+
+        Also rewrites the understanding (img2text / dense_detection) path with
+        the upstream-exact collapsed image-block scheme via
+        :meth:`_adjust_positions_for_understanding`; text-only requests and
+        ``<|fim_middle|>``-based img2img blocks are left untouched.
         """
         use_mot = False
         seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
@@ -714,11 +727,147 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
 
         if use_mot:
             return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+
+        positions = self._adjust_positions_for_understanding(positions, input_ids)
         # Text-only / img2text path: bypass the BAGEL base's img2img
         # bookkeeping (its separator-based span math does not apply here).
         return super(OmniBagelForConditionalGeneration, self).forward(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
+
+    def _adjust_positions_for_understanding(
+        self,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Rewrite position IDs for the understanding path (upstream-exact).
+
+        Upstream (``Bagel.prepare_vit_images``) collapses the ENTIRE image
+        block -- ``[<|vision_start|>] patches [<|vision_end|>]`` -- to ONE
+        shared logical position: ``packed_position_ids.extend(
+        [curr_position_id] * (num_img_tokens + 2))``, text resumes at
+        ``curr_position_id + 1``, and decode starts at the post-block rope.
+
+        Our understanding (``image`` modality) prompts carry each image as a
+        plain run of ``N`` ``<|image_pad|>`` tokens (no vision markers on this
+        path), so the translation is: every ``<|image_pad|>`` RUN is one
+        collapsed block.  For one block at the front (the standard img2text /
+        dense_detection layout):
+
+            leading text  -> 0 .. M-1          (unchanged)
+            image block   -> M        (all N share)
+            post text     -> M+1 ..          (threaded below)
+            decode step k -> rope + k, rope = M + 1 + num_post_text
+
+        Multi-image understanding requests (k blocks) each collapse to their
+        own ``M_k`` (advancing by 1 per block plus interleaved text), matching
+        upstream's per-image ``curr_position_id`` advance of exactly 1.
+
+        Text-only requests and ``<|fim_middle|>``-based img2img requests
+        contain no ``<|image_pad|>`` runs and are left untouched.  Decode
+        continuity falls out of the exported rope: the prefill's last logical
+        position is ``rope - 1``, so vLLM's vanilla ``L, L+1, ...`` decode
+        positions equal ``rope, rope+1, ...`` when the same constant collapse
+        is applied on decode steps.
+
+        Slot mapping is untouched (computed by the runner from vanilla
+        token-index positions before forward): this is a RoPE-only rewrite,
+        exactly like :meth:`_adjust_positions_for_img2img`.
+        """
+        if input_ids is None or positions.numel() == 0:
+            return positions
+
+        # Split the concatenated batch per request using the same positions
+        # reset-to-0 boundary detection as _adjust_positions_for_img2img.
+        boundaries = [0]
+        pos_list = positions.tolist()
+        for i in range(1, len(pos_list)):
+            if pos_list[i] < pos_list[i - 1]:
+                boundaries.append(i)
+        boundaries.append(len(pos_list))
+
+        has_blocks = False
+        new_positions = positions.clone()
+        ids_list = input_ids.tolist()
+        img2text_token = self._img2text_token_id
+
+        for req_idx in range(len(boundaries) - 1):
+            start = boundaries[req_idx]
+            end = boundaries[req_idx + 1]
+            req_ids = ids_list[start:end]
+
+            # Locate the <|image_pad|> runs (each run = one image block).
+            spans: list[tuple[int, int]] = []
+            scan = 0
+            while scan < len(req_ids):
+                if req_ids[scan] == img2text_token:
+                    run_start = scan
+                    while scan < len(req_ids) and req_ids[scan] == img2text_token:
+                        scan += 1
+                    spans.append((run_start, scan - run_start))
+                else:
+                    scan += 1
+
+            if not spans:
+                continue
+            has_blocks = True
+
+            # Rebase logical positions per request.  Leading text keeps 0..M-1
+            # (it already is, since vanilla prefill is sequential from 0).
+            # Each block collapses to ONE shared position M_k; text after a
+            # block resumes at the threaded cursor, so a request with k blocks
+            # occupies ``#text_tokens + k`` logical positions.
+            logical_m = 0
+            block_end = 0
+            for off, length in spans:
+                # Text before this block (or between blocks) resumes at the
+                # threaded cursor; gaps are measured in TOKEN offsets, while
+                # the cursor advances one logical position per block.
+                if off > block_end:
+                    gap_len = off - block_end
+                    new_positions[start + block_end : start + off] = torch.arange(
+                        logical_m,
+                        logical_m + gap_len,
+                        device=positions.device,
+                        dtype=positions.dtype,
+                    )
+                    logical_m += gap_len
+                # The block collapses to ONE shared logical position.
+                new_positions[start + off : start + off + length] = logical_m
+                logical_m += 1
+                block_end = off + length
+
+            # Trailing text after the last block resumes from the cursor.
+            # block_end is the LAST block's end offset within THIS request
+            # (leading-gap requests start with block_end=0 and may have trailing
+            # text after the final collapsed block).
+            trailing_start = block_end
+            trailing_len = len(req_ids) - trailing_start
+            if trailing_len > 0:
+                new_positions[start + trailing_start : end] = torch.arange(
+                    logical_m,
+                    logical_m + trailing_len,
+                    device=positions.device,
+                    dtype=positions.dtype,
+                )
+            logical_m += trailing_len
+
+            # Export the collapsed post-prefill rope (upstream ``new_rope``):
+            # decode continues at logical_m == M_k + 1 + trailing_text_len.
+            # prefill_position_count lets get_kv_transfer_metadata compute
+            # decode-step rope offsets without relying on num_computed_tokens
+            # being a prompt length.
+            rope = logical_m
+            self._ropes_pending.append(
+                {
+                    "ropes": [rope],
+                    "prefill_position_count": len(req_ids),
+                }
+            )
+
+        if not has_blocks:
+            return positions
+        return new_positions
 
     def _adjust_positions_for_img2img(
         self,
