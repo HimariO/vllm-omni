@@ -357,7 +357,9 @@ class SenseNovaVisionPipeline(BagelPipeline):
         view.  ``recon3d`` is the first task to request this; all other modes
         delegate to the BAGEL core unchanged.
         """
-
+        injected_kv = req.sampling_params.past_key_values
+        if injected_kv is not None:
+            logger.info("[SenseNova-Vision] diffusion stage - get injected_kv")
         self._apply_mode_defaults(req)
         if self._is_recon3d(req):
             return self._forward_recon3d(req)
