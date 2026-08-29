@@ -15,6 +15,7 @@ from collections.abc import Mapping
 import torch
 from transformers import BatchFeature
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargsItems
 from vllm.multimodal.parse import ImageEmbeddingItems, ImageProcessorItems, MultiModalDataItems
@@ -27,6 +28,8 @@ from vllm_omni.model_executor.models.bagel.bagel import (
     OmniBagelProcessingInfo,
     OmniBagelProcessor,
 )
+
+logger = init_logger(__name__)
 
 # Official SenseNova-Vision VAE image transform, transcribed from the upstream
 # ``ImageTransform(1024, 512, 16)`` (``sensenova_vision.py`` ``vae_transform``).
@@ -219,18 +222,31 @@ SENSENOVA_VISION_DEFAULT_MAX_LATENT_SIZE = 64
 SENSENOVA_VISION_DEFAULT_VIT_MAX_NUM_PATCH_PER_SIDE = 70
 
 
-def _sensenova_vit_patch_count(img_h: int, img_w: int) -> int:
-    """Aspect-aware ViT patch count for an input image at original resolution.
+def _sensenova_vit_patch_count(vae_h: int, vae_w: int) -> int:
+    """Aspect-aware ViT patch count for a VAE-RESIZED image.
 
-    Mirrors the model-side embedding chain (``_resize_to_stride`` then
-    ``_sensenova_vit_resize_dims``) so the processor's ``image`` / ``img2img``
-    placeholder token counts exactly equal the number of embedding rows the AR
-    model produces (VAE resize first, then the ViT transform applied to the
-    VAE-resized image, matching upstream ``InterleaveInferencer``).
+    The caller already applied the VAE transform; this applies only the ViT
+    transform ``ImageTransform(980, 224, 14)`` and counts the patches.  Used by
+    both the processor's placeholder sizing and the AR model's
+    ``_encode_vit_embeddings`` so they never diverge (the previous version
+    redundantly re-ran the VAE resize here, which the model side never does in
+    ``_encode_vit_embeddings`` - it only consumes the already-VAE-resized
+    image).
+    """
+    vit_h, vit_w = _sensenova_vit_resize_dims(int(vae_h), int(vae_w))
+    return (vit_h // SENSENOVA_VISION_VIT_STRIDE) * (vit_w // SENSENOVA_VISION_VIT_STRIDE)
+
+
+def _sensenova_understanding_patch_count(img_h: int, img_w: int) -> int:
+    """Aspect-aware ViT patch count for an ORIGINAL understanding image.
+
+    Mirrors the model-side understanding embedding chain (``_resize_to_stride``
+    then ``_encode_vit_embeddings``): the full VAE transform is applied first,
+    then the ViT transform to the VAE-resized image.  This equals the number of
+    ``<|image_pad|>`` placeholder tokens per understanding image.
     """
     vae_h, vae_w = _sensenova_vae_resize_dims(int(img_h), int(img_w))
-    vit_h, vit_w = _sensenova_vit_resize_dims(vae_h, vae_w)
-    return (vit_h // SENSENOVA_VISION_VIT_STRIDE) * (vit_w // SENSENOVA_VISION_VIT_STRIDE)
+    return _sensenova_vit_patch_count(vae_h, vae_w)
 
 
 class OmniSenseNovaVisionProcessor(OmniBagelProcessor):
@@ -331,30 +347,36 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
     ) -> list[PromptReplacement]:
         """Build prompt replacements with the SenseNova-Vision VAE transform.
 
-        Mirrors :meth:`OmniBagelMultiModalProcessor._get_prompt_updates` but
-        sizes the ``<|fim_middle|>`` VAE placeholder run with the official
-        ``ImageTransform(1024, 512, 16)`` short-edge floor, matching the AR
-        model's encoded latent grid (``_resize_to_stride`` override).  The two
-        must agree or the placeholder token count will not equal the embedding
-        length.  Otherwise identical to the base implementation.
+        Standalone (never calls the BAGEL ``super()`` implementation so the
+        legacy separator/`+1` block layout can never leak back in).  Each
+        modality contributes ONE ``PromptReplacement`` whose ``target`` is a
+        SINGLE placeholder token and whose ``replacement`` is a callable that
+        expands ONE placeholder into the full per-image block (one block per
+        placeholder token in the prompt, in order).  ``_bind_and_group_updates``
+        resolves the single update once per item index, and
+        ``apply_token_matches``/``_iter_placeholders`` match the single-token
+        targets sequentially - so N identical placeholders yield N identical
+        blocks with unambiguous binding.  Each block's full content is
+        ``[<|vision_start|>] fim-patches [<|vision_end|>]
+        [<|vision_start|>] fim-patches [<|vision_end|>]`` for img2img, or a
+        bare run of ``<|image_pad|>`` for understanding, with ``is_embed=None``
+        (every slot embedded) matching the AR model's embedding assembly.
         """
-        replacements = super()._get_prompt_updates(mm_items, hf_processor_mm_kwargs, out_mm_kwargs)
-
-        replacements = list(replacements)
         tokenizer = self.info.get_tokenizer()
-        img2img_token_id = tokenizer.get_vocab().get("<|fim_middle|>")
-        if img2img_token_id is None:
-            return replacements
-        image_token_id = tokenizer.get_vocab().get("<|image_pad|>")
+        vocab = tokenizer.get_vocab()
+
+        image_token_id = vocab.get("<|image_pad|>")
+        img2img_token_id = vocab.get("<|fim_middle|>")
+        start_of_image_id = vocab.get("<|vision_start|>")
+        end_of_image_id = vocab.get("<|vision_end|>")
 
         hf_config = self.info.get_hf_config()
-
         latent_patch_size = getattr(hf_config, "latent_patch_size", 2)
         downsample = hf_config.vae_config.get("downsample", 8)
         latent_downsample = downsample * latent_patch_size
 
-        # Original input image size for a given item (width/height in original
-        # pixel space, before any resize). Falls back to the ViT max square.
+        # Original input HxW for a given item (before any resize).  Falls back
+        # to the ViT max square when the size cannot be read.
         def _img_size(item_idx: int, modality: str):
             item = mm_items.get_items(modality, (ImageProcessorItems, ImageEmbeddingItems))
             if hasattr(item, "get_image_size"):
@@ -365,11 +387,15 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
                     pass
             return SENSENOVA_VISION_VIT_MAX_SIZE, SENSENOVA_VISION_VIT_MAX_SIZE
 
-        def get_image_replacement(item_idx: int):
+        def understanding_block(item_idx: int) -> PromptUpdateDetails:
+            # Aspect-aware understanding placeholder run:
+            # ``_sensenova_understanding_patch_count`` applies the same
+            # VAE->ViT two-stage sizing as the model's img2text path
+            # (``_process_img2text_input``).
             h, w = _img_size(item_idx, "image")
-            return [image_token_id] * _sensenova_vit_patch_count(h, w)
+            return PromptUpdateDetails.from_seq([image_token_id] * _sensenova_understanding_patch_count(h, w))
 
-        def get_img2img_replacement(item_idx: int):
+        def img2img_block(item_idx: int) -> PromptUpdateDetails:
             h, w = _img_size(item_idx, "img2img")
 
             # Two-stage official transform: VAE resize first, then the ViT
@@ -378,27 +404,25 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
             # are aspect-preserving; the ViT patch count follows the aspect
             # ratio (capped at 4900 = 70x70, never exceeds the old square).
             new_h, new_w = _sensenova_vae_resize_dims(int(h), int(w))
-            vit_h, vit_w = _sensenova_vit_resize_dims(new_h, new_w)
             num_vae_patches = (new_h // latent_downsample) * (new_w // latent_downsample)
-            num_vit_patches = (vit_h // SENSENOVA_VISION_VIT_STRIDE) * (vit_w // SENSENOVA_VISION_VIT_STRIDE)
+            num_vit_patches = _sensenova_vit_patch_count(new_h, new_w)
             # Upstream-exact layout (Bagel prepare_vae_images /
             # prepare_vit_images): each block bracketed by <|vision_start|> ...
             # <|vision_end|>, blocks ADJACENT - no <|fim_middle|> placeholder
             # run and no separator token ever appear in upstream sequences.
             #
-            # EVERY slot in the expanded block carries an mm embedding,
-            # mirroring upstream, which assigns embed_tokens(start/end_of_image)
-            # to the marker rows and computed VAE-latent / ViT-patch embeddings
-            # to the patch rows (_process_img2img_input builds exactly that
-            # combined tensor). This is REQUIRED for vLLM's engine-side
-            # placement: PlaceholderRange positions are matched to embedding
-            # rows by the RUNNING COUNT of is_embed=True slots, so any False
-            # slot interleaved INSIDE the placeholder shifts every subsequent
+            # EVERY slot in the expanded block carries an mm embedding
+            # (``is_embed=None``), mirroring upstream, which assigns
+            # embed_tokens(start/end_of_image) to the marker rows and computed
+            # VAE-latent / ViT-patch embeddings to the patch rows
+            # (``_process_img2img_input`` builds exactly that combined tensor).
+            # This is REQUIRED for vLLM's engine-side placement:
+            # PlaceholderRange positions are matched to embedding rows by the
+            # RUNNING COUNT of is_embed=True slots, so any False slot
+            # interleaved INSIDE the placeholder shifts every subsequent
             # embedding onto the wrong token (observed GPU-wide corruption in
             # out_10 with marker rows marked False). all-True keeps the
             # position->row identity mapping exact.
-            start_of_image_id = tokenizer.get_vocab()["<|vision_start|>"]
-            end_of_image_id = tokenizer.get_vocab()["<|vision_end|>"]
             tokens = (
                 [start_of_image_id]
                 + [img2img_token_id] * num_vae_patches
@@ -407,26 +431,26 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
                 + [img2img_token_id] * num_vit_patches
                 + [end_of_image_id]
             )
-
             return PromptUpdateDetails.from_seq(tokens)
 
-        # Replace the image (img2text) and img2img placeholder updates with
-        # aspect-aware resized versions; keep everything else the base produced.
         out: list[PromptReplacement] = []
-        for r in replacements:
-            if r.modality == "image":
-                r = PromptReplacement(
+        if image_token_id is not None and "image" in mm_items.get_all_counts():
+            out.append(
+                PromptReplacement(
                     modality="image",
                     target=[image_token_id],
-                    replacement=get_image_replacement,
+                    replacement=understanding_block,
                 )
-            elif r.modality == "img2img":
-                r = PromptReplacement(
-                    modality="img2img",
-                    target=[img2img_token_id],
-                    replacement=get_img2img_replacement,
+            )
+        if img2img_token_id is not None and start_of_image_id is not None and end_of_image_id is not None:
+            if "img2img" in mm_items.get_all_counts():
+                out.append(
+                    PromptReplacement(
+                        modality="img2img",
+                        target=[img2img_token_id],
+                        replacement=img2img_block,
+                    )
                 )
-            out.append(r)
         return out
 
 
@@ -560,8 +584,15 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             num_patches = embed.shape[1]
             hidden = embed.shape[2]
             ph = self.config.vit_config.patch_size
-            h_coords = torch.arange(vit_h // ph, device=embed.device)
-            w_coords = torch.arange(vit_w // ph, device=embed.device)
+            # The ViT grid for the position IDs must be the EXACT patch grid
+            # produced by the resize (and equal to the placeholder patch count).
+            # ``vit_h // ph`` is correct only when ``vit_h`` is patch-aligned;
+            # use the same count helper the processor uses (never assume the
+            # resized dims divide evenly by the patch size).
+            num_patches_h = vit_h // ph
+            num_patches_w = vit_w // ph
+            h_coords = torch.arange(num_patches_h, device=embed.device)
+            w_coords = torch.arange(num_patches_w, device=embed.device)
             position_ids = (h_coords[:, None] * self.config.vit_max_num_patch_per_side + w_coords).flatten()
             position_ids = position_ids.unsqueeze(0).expand(1, -1).flatten()
             pos_embeds = self.vit_pos_embed(position_ids)
@@ -698,176 +729,24 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         SEPARATOR-FREE block span (``num_vae + num_vit`` tokens, see
         ``_get_prompt_updates`` above): the BAGEL base assumes a legacy
         ``<|fim_middle|>`` separator between the VAE and ViT sections that
-        upstream sequences never contain.
-
-        Also rewrites the understanding (img2text / dense_detection) path with
-        the upstream-exact collapsed image-block scheme via
-        :meth:`_adjust_positions_for_understanding`; text-only requests and
-        ``<|fim_middle|>``-based img2img blocks are left untouched.
+        upstream sequences never contain.  Text-only / img2text requests
+        bypass this path entirely and fall through to the base forward.
         """
         use_mot = False
-        seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
 
         if self._pending_img2img_info:
             self._log_prompt_token_probe(input_ids)
             positions = self._adjust_positions_for_img2img(positions, input_ids)
             use_mot = True
-        elif self._last_img2img_info is not None:
-            info = self._last_img2img_info
-            num_vae, num_vit, _, _ = info
-            num_img2img = num_vae + num_vit  # no separator (upstream-exact)
-
-            if seq_len >= num_img2img:
-                self._pending_img2img_info = [info]
-                positions = self._adjust_positions_for_img2img(positions, input_ids)
-                use_mot = True
-            else:
-                rope = positions[seq_len - 1] + 1
-                self._ropes_pending.append({"ropes": [rope]})
 
         if use_mot:
             return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
 
-        positions = self._adjust_positions_for_understanding(positions, input_ids)
         # Text-only / img2text path: bypass the BAGEL base's img2img
         # bookkeeping (its separator-based span math does not apply here).
         return super(OmniBagelForConditionalGeneration, self).forward(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
-
-    def _adjust_positions_for_understanding(
-        self,
-        positions: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Rewrite position IDs for the understanding path (upstream-exact).
-
-        Upstream (``Bagel.prepare_vit_images``) collapses the ENTIRE image
-        block -- ``[<|vision_start|>] patches [<|vision_end|>]`` -- to ONE
-        shared logical position: ``packed_position_ids.extend(
-        [curr_position_id] * (num_img_tokens + 2))``, text resumes at
-        ``curr_position_id + 1``, and decode starts at the post-block rope.
-
-        Our understanding (``image`` modality) prompts carry each image as a
-        plain run of ``N`` ``<|image_pad|>`` tokens (no vision markers on this
-        path), so the translation is: every ``<|image_pad|>`` RUN is one
-        collapsed block.  For one block at the front (the standard img2text /
-        dense_detection layout):
-
-            leading text  -> 0 .. M-1          (unchanged)
-            image block   -> M        (all N share)
-            post text     -> M+1 ..          (threaded below)
-            decode step k -> rope + k, rope = M + 1 + num_post_text
-
-        Multi-image understanding requests (k blocks) each collapse to their
-        own ``M_k`` (advancing by 1 per block plus interleaved text), matching
-        upstream's per-image ``curr_position_id`` advance of exactly 1.
-
-        Text-only requests and ``<|fim_middle|>``-based img2img requests
-        contain no ``<|image_pad|>`` runs and are left untouched.  Decode
-        continuity falls out of the exported rope: the prefill's last logical
-        position is ``rope - 1``, so vLLM's vanilla ``L, L+1, ...`` decode
-        positions equal ``rope, rope+1, ...`` when the same constant collapse
-        is applied on decode steps.
-
-        Slot mapping is untouched (computed by the runner from vanilla
-        token-index positions before forward): this is a RoPE-only rewrite,
-        exactly like :meth:`_adjust_positions_for_img2img`.
-        """
-        if input_ids is None or positions.numel() == 0:
-            return positions
-
-        # Split the concatenated batch per request using the same positions
-        # reset-to-0 boundary detection as _adjust_positions_for_img2img.
-        boundaries = [0]
-        pos_list = positions.tolist()
-        for i in range(1, len(pos_list)):
-            if pos_list[i] < pos_list[i - 1]:
-                boundaries.append(i)
-        boundaries.append(len(pos_list))
-
-        has_blocks = False
-        new_positions = positions.clone()
-        ids_list = input_ids.tolist()
-        img2text_token = self._img2text_token_id
-
-        for req_idx in range(len(boundaries) - 1):
-            start = boundaries[req_idx]
-            end = boundaries[req_idx + 1]
-            req_ids = ids_list[start:end]
-
-            # Locate the <|image_pad|> runs (each run = one image block).
-            spans: list[tuple[int, int]] = []
-            scan = 0
-            while scan < len(req_ids):
-                if req_ids[scan] == img2text_token:
-                    run_start = scan
-                    while scan < len(req_ids) and req_ids[scan] == img2text_token:
-                        scan += 1
-                    spans.append((run_start, scan - run_start))
-                else:
-                    scan += 1
-
-            if not spans:
-                continue
-            has_blocks = True
-
-            # Rebase logical positions per request.  Leading text keeps 0..M-1
-            # (it already is, since vanilla prefill is sequential from 0).
-            # Each block collapses to ONE shared position M_k; text after a
-            # block resumes at the threaded cursor, so a request with k blocks
-            # occupies ``#text_tokens + k`` logical positions.
-            logical_m = 0
-            block_end = 0
-            for off, length in spans:
-                # Text before this block (or between blocks) resumes at the
-                # threaded cursor; gaps are measured in TOKEN offsets, while
-                # the cursor advances one logical position per block.
-                if off > block_end:
-                    gap_len = off - block_end
-                    new_positions[start + block_end : start + off] = torch.arange(
-                        logical_m,
-                        logical_m + gap_len,
-                        device=positions.device,
-                        dtype=positions.dtype,
-                    )
-                    logical_m += gap_len
-                # The block collapses to ONE shared logical position.
-                new_positions[start + off : start + off + length] = logical_m
-                logical_m += 1
-                block_end = off + length
-
-            # Trailing text after the last block resumes from the cursor.
-            # block_end is the LAST block's end offset within THIS request
-            # (leading-gap requests start with block_end=0 and may have trailing
-            # text after the final collapsed block).
-            trailing_start = block_end
-            trailing_len = len(req_ids) - trailing_start
-            if trailing_len > 0:
-                new_positions[start + trailing_start : end] = torch.arange(
-                    logical_m,
-                    logical_m + trailing_len,
-                    device=positions.device,
-                    dtype=positions.dtype,
-                )
-            logical_m += trailing_len
-
-            # Export the collapsed post-prefill rope (upstream ``new_rope``):
-            # decode continues at logical_m == M_k + 1 + trailing_text_len.
-            # prefill_position_count lets get_kv_transfer_metadata compute
-            # decode-step rope offsets without relying on num_computed_tokens
-            # being a prompt length.
-            rope = logical_m
-            self._ropes_pending.append(
-                {
-                    "ropes": [rope],
-                    "prefill_position_count": len(req_ids),
-                }
-            )
-
-        if not has_blocks:
-            return positions
-        return new_positions
 
     def _adjust_positions_for_img2img(
         self,
@@ -1007,64 +886,19 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
                 continue
 
             if img2img_idx < len(info_list):
-                cur_info = info_list[img2img_idx]
-            elif self._last_img2img_info is not None:
-                cur_info = self._last_img2img_info
-            else:
-                cur_info = None
-
-            if cur_info is not None:
-                num_vae, num_vit, img_H, img_W = cur_info
-                num_img2img = num_vae + num_vit  # no separator (upstream-exact)
-
-                if req_len >= num_img2img:
-                    pre_text_len = 0
-                    if input_ids is not None:
-                        req_ids_slice = input_ids[start:end]
-                        indices = (req_ids_slice == self._start_of_image_id).nonzero(as_tuple=True)[0]
-                        if indices.numel() > 0:
-                            pre_text_len = int(indices[0].item())
-
-                    M = pre_text_len
-                    img_start = start + M
-                    post_text_start = img_start + num_img2img
-
-                    if M > 0:
-                        new_positions[start:img_start] = torch.arange(
-                            0, M, device=positions.device, dtype=positions.dtype
-                        )
-
-                    new_positions[img_start : img_start + num_vae] = M
-                    vit_start = img_start + num_vae  # no separator
-                    new_positions[vit_start : vit_start + num_vit] = M + 1
-
-                    num_post_text = end - post_text_start
-                    if num_post_text > 0:
-                        new_positions[post_text_start:end] = torch.arange(
-                            M + 2,
-                            M + 2 + num_post_text,
-                            device=positions.device,
-                            dtype=positions.dtype,
-                        )
-
-                    vae_patches_start = img_start + 1
-                    vae_patches_end = img_start + num_vae - 1
-                    if vae_patches_end > vae_patches_start:
-                        vae_mask[vae_patches_start:vae_patches_end] = True
-
-                    rope = M + 2 + num_post_text
-                    self._ropes_pending.append(
-                        {
-                            "ropes": [rope],
-                            "image_shape": [img_H, img_W],
-                            "prefill_position_count": req_len,
-                        }
-                    )
-                    img2img_idx += 1
-                    continue
+                # No spans matched for this request (should not happen when the
+                # processor laid out the upstream-exact blocks): fall through
+                # and leave the default sequential positions + rope for it.
+                logger.warning(
+                    "BAGEL-SenseNova img2img block scan matched no spans for "
+                    "request at [%d:%d]; keeping sequential positions.",
+                    start,
+                    end,
+                )
 
             rope = int(new_positions[end - 1].item()) + 1
             self._ropes_pending.append({"ropes": [rope]})
+            img2img_idx += 1
 
         # Resolve mask occupancy once here (the only .any() syncs on this path)
         # and cache it; the per-layer routing reads these flags instead of
