@@ -10,7 +10,7 @@ and only overrides the SenseNovaVision checkpoint defaults plus additive feature
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import torch
 from transformers import BatchFeature
@@ -503,6 +503,18 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         else:
             self._img2text_token_id = -1
 
+        # Per-request img2img layout state machine.  Mirrors what
+        # the single-image base keeps in ``_pending_img2img_info``/``_last`` but
+        # keyed by req_id so continuation chunks and split blocks survive
+        # across forward() calls.  See _adjust_positions_for_img2img.
+        self._img2img_layouts: dict[str, dict[str, object]] = {}
+        # Per-step schedule (req_id, num_computed_tokens, num_scheduled_tokens)
+        # captured in batch order by prepare_runner_inputs.  The AR runner
+        # already provides these per-request tensors with NO core runner
+        # change; there is deliberately no ``num_prompt_tokens`` channel (the
+        # reverted runner hook), so the state machine must not depend on one.
+        self._step_req_schedule: list[tuple[str, int, int]] = []
+
     @staticmethod
     def _apply_sensenova_vision_config_defaults(config) -> None:
         """Force SenseNovaVision checkpoint defaults on the HF config in place."""
@@ -599,6 +611,46 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             pos_embeds = pos_embeds.reshape(1, num_patches, hidden)
             vit_embeds.append(embed + pos_embeds.to(embed.device))
         return tuple(vit_embeds)
+
+    def _clear_warmup_state(self):
+        """Clear stale state accumulated during warmup/profiling runs."""
+        super()._clear_warmup_state()
+        self._img2img_layouts.clear()
+        self._step_req_schedule.clear()
+
+    def prepare_runner_inputs(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        req_ids: Sequence[str],
+        num_computed_tokens: Sequence[int],
+        num_scheduled_tokens: Sequence[int],
+        input_ids_buffer: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Restore input_ids and capture the per-request step schedule.
+
+        Mirrors the BAGEL base (restores ``input_ids`` from
+        ``input_ids_buffer`` so the position rewrite can locate the
+        ``<|vision_start|>`` block) and additionally records the current
+        step's per-request ``(req_id, num_computed_tokens,
+        num_scheduled_tokens)`` in batch order -- exactly the tensors the AR
+        runner already passes to every model, so the model needs NO runner
+        change.  The schedule lets ``forward`` /
+        ``_adjust_positions_for_img2img`` gate per request instead of using
+        the batch-wide padded length, and tells it where each chunk starts
+        inside the request layout (split blocks) and how many logical
+        positions precede this chunk (``num_computed``).
+        """
+        schedule: list[tuple[str, int, int]] = []
+        for i, rid in enumerate(req_ids):
+            n_computed = int(num_computed_tokens[i]) if i < len(num_computed_tokens) else 0
+            n_scheduled = int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
+            schedule.append((str(rid), n_computed, n_scheduled))
+        self._step_req_schedule = schedule
+        if inputs_embeds is not None and input_ids is None and input_ids_buffer is not None:
+            input_ids = input_ids_buffer
+        return input_ids, positions
 
     def _process_img2text_input(self, multimodal_input):
         """Base img2text (understanding) embedding, but with upstream sizing.
@@ -731,10 +783,30 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         ``<|fim_middle|>`` separator between the VAE and ViT sections that
         upstream sequences never contain.  Text-only / img2text requests
         bypass this path entirely and fall through to the base forward.
-        """
-        use_mot = False
 
-        if self._pending_img2img_info:
+        Gating is per-request, from the step schedule captured by
+        ``prepare_runner_inputs`` (``_step_req_schedule``): the batch-wide
+        ``inputs_embeds.shape[0]`` / ``positions.shape[0]`` length is replaced
+        by each request's ``(num_computed, num_scheduled)`` so a padded
+        CUDA-graph batch or a sibling request can never change how a
+        request's chunk is classified.  A request enters the img2img MoT path
+        when this step contains an active layout for it (``_img2img_layouts``)
+        or when pending geometry is queued.  See ``_adjust_positions_for_img2img``
+        for the per-request collapse / partial-collapse / rope-only logic.
+        """
+        # _adjust_positions_for_img2img consumes _step_req_schedule; do not
+        # clear it here.
+        schedule = self._step_req_schedule or []
+
+        use_mot = False
+        any_img2img = bool(self._pending_img2img_info) or bool(self._img2img_layouts)
+        if not any_img2img:
+            for rid, _n_computed, _n_scheduled in schedule:
+                if rid in self._img2img_layouts:
+                    any_img2img = True
+                    break
+
+        if any_img2img:
             self._log_prompt_token_probe(input_ids)
             positions = self._adjust_positions_for_img2img(positions, input_ids)
             use_mot = True
@@ -757,13 +829,11 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
 
         Blocks are ``[<|vision_start|>] fim-patches [<|vision_end|>]
         [<|vision_start|>] fim-patches [<|vision_end|>]`` -- ADJACENT, no
-        separator token (see ``_get_prompt_updates``).  Detected via the
-        leading ``<|vision_start|>`` (thinking-mode pre-text never carries
-        vision tokens):
+        separator token (see ``_get_prompt_updates``):
 
             pre_text -> 0 .. M-1
-            VAE sect -> M       (all share, markers included)
-            ViT sect -> M+1     (all share, markers included)
+            VAE sect -> M       (all share)
+            ViT sect -> M+1     (all share)
             post_text-> M+2, M+3, ...
 
         When M=0 (standard img2img) this reduces to VAE->0, ViT->1, text->2..
@@ -772,139 +842,445 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         requests): every block collapses to two logical positions anchored at
         its own M, with interleaved text resuming at M+2, so a request with
         k blocks occupies ``#text_tokens + 2*k`` logical positions.
+
+        The rewrite is driven by the per-request step schedule captured by
+        ``prepare_runner_inputs`` (``_step_req_schedule``) instead of the
+        batch-wide ``positions``/``inputs_embeds`` length and the
+        position-reset boundary detection (both unreliable for a padded
+        CUDA-graph batch and for continuation prefill chunks where positions
+        CONTINUE from each request's ``num_computed_tokens``).  Per-request
+        layout state in ``_img2img_layouts`` survives across forward() calls
+        so blocks split by chunked prefill collapse incrementally without
+        drift:
+
+        - first chunk: geometry is bound positionally from
+          ``_pending_img2img_info``.  If the window ends mid-block the
+          partial block's geometry is bound too and the phase machine
+          resumes it in the continuation chunk.
+        - continuation chunk: the layout's phase/anchors decide collapse.
+          The encoder re-encodes a block that spans a chunk boundary, so the
+          FIFO is refilled with a STALE re-encode of that block; the stale
+          entry is skipped (once) at geometry resolution ONLY when the chunk
+          started mid-block (``_stale_possible``), never for a chunk whose
+          blocks are fully contained.
+        - first decode step: prefill has ended exactly when a step is a
+          single token (``num_scheduled == 1``), the layout is idle in text
+          phase, and the token is not a block SOI.  ``num_computed ==
+          prompt_len`` there, so the FULL rope metadata (``image_shape`` +
+          ``prefill_position_count``) is emitted on that step (the
+          ``flush_pending_metadata`` guard keeps it across later plain
+          decode ropes) and the layout is pruned.  The scheduler processes
+          one token per request on every decode step, and chunked prefill
+          never reaches prompt-end with a >1-token step misclassified: only
+          a 1-token prefill chunk that happens to be pure text could
+          miss-fire, and the rope arithmetic stays self-consistent there
+          (prefill_rope and prefill_position_count are both captured before
+          that token).
+
+        One ropes-pending entry is appended PER SEGMENT in batch order
+        (1:1 mapping with ``flush_pending_metadata``); text-only siblings get
+        the plain rope fallback, exactly like the BAGEL base.
         """
         info_list = self._pending_img2img_info
         self._pending_img2img_info = []
 
-        if not info_list:
+        schedule = self._step_req_schedule
+        self._step_req_schedule = []
+        if not schedule:
+            # No schedule (legacy/warmup direct call): treat the whole batch
+            # as one segment and hand out the pending infos in order.
+            schedule = [("", 0, len(positions))]
+        if len(schedule) == 1:
+            # Single-request schedule may describe only the unpadded length;
+            # clamp to the actual positions length.
+            rid, n_computed, n_scheduled = schedule[0]
+            schedule = [(str(rid), n_computed, min(n_scheduled, len(positions)))]
+
+        # Per-request token segments in batch order.  ``(rid, start, end,
+        # n_computed, n_scheduled)`` where [start, end) is the token slice of
+        # this request inside the tensor.
+        req_segments = []
+        token_off = 0
+        for rid, n_computed, n_scheduled in schedule:
+            end = min(token_off + max(n_scheduled, 0), len(positions))
+            req_segments.append((str(rid), token_off, end, n_computed, n_scheduled))
+            token_off += max(n_scheduled, 0)
+
+        new_positions = positions.clone()
+        vae_mask = torch.zeros(len(positions), dtype=torch.bool, device=positions.device)
+        # Host copy of input_ids for placeholder matching (same rationale as
+        # the positions copy above: per-element device indexing would sync on
+        # every iteration).
+        ids_list = input_ids.tolist() if input_ids is not None else None
+
+        info_holder = [0]  # next unconsumed entry of THIS chunk's info_list
+        any_active = False
+        for rid, start, end, n_computed, n_scheduled in req_segments:
+            req_len = end - start
+            if req_len <= 0:
+                continue
+
+            layout = self._img2img_layouts.get(rid)
+            if layout is None:
+                # First chunk: bind geometry positionally from the FIFO,
+                # including a PARTIAL block cut by the window end.
+                spans, partial, bound = self._match_leading_blocks(ids_list, start, end, info_list, info_holder)
+                if bound:
+                    layout = self._enter_layout_from_span(rid, spans, partial, n_computed)
+                    self._img2img_layouts[rid] = layout
+
+            if layout is None:
+                # text-only sibling / decode-after-prune: plain rope
+                # fallback (positions untouched).
+                rope = int(new_positions[end - 1].item()) + 1 if end > start else 0
+                self._ropes_pending.append({"ropes": [rope]})
+                continue
+
+            # First decode step = prefill done: exactly one token, layout
+            # idle in text phase, no block SOI in the chunk.  At that point
+            # ``num_computed == prompt_len``, so the full rope metadata is
+            # captured (the flush_pending_metadata guard keeps it across the
+            # later plain decode ropes) and the layout is pruned.
+            is_first_decode = False
+            if (
+                n_scheduled == 1
+                and req_len == 1
+                and layout.get("phase") == "text"
+                and int(layout.get("_remaining", 0)) <= 0
+            ):
+                tok = ids_list[start] if ids_list is not None else None
+                if tok is None or tok != self._start_of_image_id:
+                    is_first_decode = True
+
+            if is_first_decode:
+                self._emit_layout_rope(layout, n_computed, n_scheduled, done=True)
+                self._img2img_layouts.pop(rid, None)
+                continue
+
+            any_active = True
+
+            # Collapse the tokens in [start, end) according to the layout.
+            self._collapse_chunk_into_layout(
+                layout, start, end, new_positions, vae_mask, ids_list, info_list, info_holder
+            )
+            self._emit_layout_rope(layout, n_computed, n_scheduled, done=False)
+
+        if not any_active:
             self._vae_token_mask = None
             self._has_vae_tokens = False
             self._has_non_vae_tokens = True
-            return positions
+            return new_positions
 
-        boundaries = [0]
-        # Copy positions to the host once: indexing the CUDA tensor element by
-        # element in the loop below would sync the device on every iteration.
-        pos_list = positions.tolist()
-        for i in range(1, len(pos_list)):
-            if pos_list[i] < pos_list[i - 1]:
-                boundaries.append(i)
-        boundaries.append(len(pos_list))
-
-        num_requests = len(boundaries) - 1
-        new_positions = positions.clone()
-        vae_mask = torch.zeros(len(positions), dtype=torch.bool, device=positions.device)
-
-        img2img_idx = 0
-        # Host copy of input_ids for placeholder matching (same rationale as
-        # the positions copy above: per-element device indexing would sync on
-        # every token).
-        ids_list = input_ids.tolist() if input_ids is not None else None
-        for req_idx in range(num_requests):
-            start = boundaries[req_idx]
-            end = boundaries[req_idx + 1]
-            req_len = end - start
-
-            # Match this request's img2img blocks against the pending infos.
-            # A block is ``[<|vision_start|>] fim-patches [<|vision_end|>]
-            # [<|vision_start|>] fim-patches [<|vision_end|>]`` -- exactly
-            # ``num_vae + num_vit`` tokens, NO separator -- so adjacent blocks
-            # concatenate into longer runs that this scan still splits
-            # correctly by advancing block_len tokens per matched info.
-            # Infos left over stay queued for the following requests in the
-            # batch.
-            spans = []
-            if ids_list is not None and img2img_idx < len(info_list):
-                req_ids = ids_list[start:end]
-                soi = self._start_of_image_id
-                eoi = self._end_of_image_id
-                fim = self._img2img_token_id
-                scan = 0
-                info_i = img2img_idx
-                while info_i < len(info_list):
-                    num_vae, num_vit = info_list[info_i][0], info_list[info_i][1]
-                    block_len = num_vae + num_vit  # no separator
-                    while scan < req_len and req_ids[scan] != soi:
-                        scan += 1
-                    if scan >= req_len or req_len - scan < block_len:
-                        break
-                    blk = req_ids[scan : scan + block_len]
-                    if (
-                        blk[0] != soi
-                        or blk[num_vae - 1] != eoi
-                        or blk[num_vae] != soi
-                        or blk[-1] != eoi
-                        or any(t != fim for t in blk[1 : num_vae - 1])
-                        or any(t != fim for t in blk[num_vae + 1 : -1])
-                    ):
-                        break
-                    spans.append((scan, *info_list[info_i]))
-                    scan += block_len
-                    info_i += 1
-
-            if spans:
-                # Logical positions are rebased per request: leading text keeps
-                # 0..M1-1, every block collapses to TWO shared logical positions
-                # (VAE section -> M, ViT section -> M+1) regardless of token
-                # count, and text after a block resumes at M+2. NOTE: a block's
-                # logical anchor M is NOT its token offset once earlier blocks
-                # have compressed their tokens, hence the threaded cursor.
-                first_off = spans[0][0]
-                if first_off > 0:
-                    new_positions[start : start + first_off] = torch.arange(
-                        0, first_off, device=positions.device, dtype=positions.dtype
-                    )
-                logical_m = first_off
-                for k, (off, num_vae, num_vit, img_H, img_W) in enumerate(spans):
-                    img_start = start + off
-                    vit_start = img_start + num_vae  # no separator
-                    new_positions[img_start:vit_start] = logical_m  # VAE section (markers incl.)
-                    new_positions[vit_start : vit_start + num_vit] = logical_m + 1  # ViT section
-                    vae_lo = img_start + 1
-                    vae_hi = img_start + num_vae - 1
-                    if vae_hi > vae_lo:
-                        vae_mask[vae_lo:vae_hi] = True
-                    block_end = off + num_vae + num_vit
-                    next_off = spans[k + 1][0] if k + 1 < len(spans) else req_len
-                    gap_len = next_off - block_end
-                    if gap_len > 0:
-                        new_positions[start + block_end : start + block_end + gap_len] = torch.arange(
-                            logical_m + 2,
-                            logical_m + 2 + gap_len,
-                            device=positions.device,
-                            dtype=positions.dtype,
-                        )
-                    logical_m += 2 + gap_len
-                self._ropes_pending.append(
-                    {
-                        "ropes": [logical_m],
-                        "image_shape": [spans[-1][3], spans[-1][4]],
-                        "prefill_position_count": req_len,
-                    }
-                )
-                img2img_idx += len(spans)
-                continue
-
-            if img2img_idx < len(info_list):
-                # No spans matched for this request (should not happen when the
-                # processor laid out the upstream-exact blocks): fall through
-                # and leave the default sequential positions + rope for it.
-                logger.warning(
-                    "BAGEL-SenseNova img2img block scan matched no spans for "
-                    "request at [%d:%d]; keeping sequential positions.",
-                    start,
-                    end,
-                )
-
-            rope = int(new_positions[end - 1].item()) + 1
-            self._ropes_pending.append({"ropes": [rope]})
-            img2img_idx += 1
-
-        # Resolve mask occupancy once here (the only .any() syncs on this path)
-        # and cache it; the per-layer routing reads these flags instead of
-        # re-checking the mask on every decoder layer.
+        # Resolve mask occupancy once here (the only .any() syncs on this
+        # path) and cache it; the per-layer routing reads these flags instead
+        # of re-checking the mask on every decoder layer.
         has_vae = bool(vae_mask.any())
         self._vae_token_mask = vae_mask if has_vae else None
         self._has_vae_tokens = has_vae
         self._has_non_vae_tokens = bool((~vae_mask).any()) if has_vae else True
         return new_positions
+
+    # ------------------------------------------------------------------
+    # Per-request img2img layout helpers
+    # ------------------------------------------------------------------
+
+    def _match_leading_blocks(
+        self,
+        ids_list: list[int] | None,
+        start: int,
+        end: int,
+        info_list: list[tuple[int, int, int, int]],
+        info_holder: list[int],
+    ) -> tuple[list[tuple[int, int, int, int, int]], tuple | None, bool]:
+        """First-chunk binding against the pending infos, in order.
+
+        Returns ``(spans, partial, bound)``:
+
+        - ``spans``: complete blocks matched and consumed from the FIFO
+          (``(off, num_vae, num_vit, H, W)``, offsets absolute in the batch).
+        - ``partial``: ``(off, num_vae, num_vit, H, W)`` when the window ends
+          mid-block -- its geometry is bound positionally (Bug C) and the
+          phase machine resumes it in the continuation chunk.
+        - ``bound``: True iff any geometry was bound.
+        """
+        spans = []
+        partial = None
+        if ids_list is None:
+            return spans, partial, False
+        section = ids_list[start:end]
+        soi = self._start_of_image_id
+        eoi = self._end_of_image_id
+        fim = self._img2img_token_id
+        scan = 0
+        while True:
+            while scan < len(section) and section[scan] != soi:
+                scan += 1
+            if scan >= len(section):
+                break
+            idx = info_holder[0]
+            if idx >= len(info_list):
+                break
+            num_vae, num_vit = int(info_list[idx][0]), int(info_list[idx][1])
+            block_len = num_vae + num_vit  # no separator
+            if len(section) - scan < block_len:
+                # Block starts but the window cuts it short: bind geometry.
+                partial = (start + scan, num_vae, num_vit, int(info_list[idx][2]), int(info_list[idx][3]))
+                info_holder[0] = idx + 1
+                break
+            blk = section[scan : scan + block_len]
+            if not (
+                blk[0] == soi
+                and blk[num_vae - 1] == eoi
+                and blk[num_vae] == soi
+                and blk[-1] == eoi
+                and all(t == fim for t in blk[1 : num_vae - 1])
+                and all(t == fim for t in blk[num_vae + 1 : -1])
+            ):
+                break
+            spans.append((start + scan, num_vae, num_vit, int(info_list[idx][2]), int(info_list[idx][3])))
+            info_holder[0] = idx + 1
+            scan += block_len
+        return spans, partial, bool(spans) or partial is not None
+
+    def _enter_layout_from_span(
+        self,
+        rid: str,
+        spans: list[tuple[int, int, int, int, int]],
+        partial: tuple | None,
+        segment_base: int,
+    ) -> dict[str, object]:
+        """Initialize a fresh per-request layout from the matched geometry.
+
+        The layout keeps a persistent logical cursor (``next_logical`` /
+        ``next_text``) seeded from the raw position base (0 for a fresh
+        request, ``num_computed_tokens`` for a continuation chunk whose
+        layout was never bound), plus the image shape of the LAST block seen
+        so far (``_last_img_shape``) so the final prefill chunk's rope
+        metadata carries the correct ``image_shape``.
+        """
+        if partial is not None:
+            last_shape = (int(partial[3]), int(partial[4]))
+        else:
+            last_shape = (int(spans[-1][3]), int(spans[-1][4]))
+        layout = {
+            "rid": rid,
+            "phase": "text",
+            "next_text": int(segment_base),
+            "next_logical": int(segment_base),
+            "_seeded_pos": int(segment_base),
+            "_spans": spans,
+            "_span_i": 0,
+            "_block_info": None,
+            "_last_img_shape": last_shape,
+            "_last_completed_geometry": None,
+            "_stale_possible": False,
+            "_has_vae": False,
+        }
+        if partial is not None:
+            layout["_block_info"] = (int(partial[1]), int(partial[2]), int(partial[3]), int(partial[4]))
+        return layout
+
+    def _resolve_block_geometry(
+        self,
+        layout: dict[str, object],
+        info_list: list[tuple[int, int, int, int]],
+        info_holder: list[int],
+        abs_off: int,
+    ) -> tuple[int | None, int | None]:
+        """Geometry for the block whose SOI sits at absolute ``abs_off``.
+
+        Resolution order: (1) the next matched span, (2) a seeded
+        ``_block_info`` (partial first block), (3) the per-chunk FIFO --
+        skipping ONE stale re-encode of the just-completed block, but ONLY
+        when this chunk started mid-block (``_stale_possible``; the encoder
+        re-encodes a boundary-spanning block, so its info is refilled at the
+        head while the continuation chunk finishes it -- a fresh chunk whose
+        blocks are fully contained has no stale entry and must not skip),
+        (4) the last-completed geometry as a final fallback.
+        """
+        spans = layout.get("_spans") or []
+        span_i = int(layout.get("_span_i", 0))
+        if span_i < len(spans) and spans[span_i][0] == abs_off:
+            sp = spans[span_i]
+            layout["_span_i"] = span_i + 1
+            layout["_last_img_shape"] = (int(sp[3]), int(sp[4]))
+            return int(sp[1]), int(sp[2])
+
+        block_info = layout.get("_block_info")
+        if block_info is not None:
+            layout["_block_info"] = None
+            layout["_last_img_shape"] = (int(block_info[2]), int(block_info[3]))
+            return int(block_info[0]), int(block_info[1])
+
+        idx = info_holder[0]
+        last = layout.get("_last_completed_geometry")
+        if (
+            layout.get("_stale_possible")
+            and last is not None
+            and idx < len(info_list)
+            and tuple(info_list[idx][:2]) == tuple(last)
+        ):
+            idx += 1  # stale re-encode of the just-completed block
+            layout["_stale_possible"] = False
+        if idx < len(info_list):
+            info = info_list[idx]
+            info_holder[0] = idx + 1
+            layout["_last_img_shape"] = (int(info[2]), int(info[3]))
+            return int(info[0]), int(info[1])
+        if last is not None:
+            return int(last[0]), int(last[1])
+        return None, None
+
+    def _collapse_chunk_into_layout(
+        self,
+        layout: dict[str, object],
+        start: int,
+        end: int,
+        new_positions: torch.Tensor,
+        vae_mask: torch.Tensor,
+        ids_list: list[int] | None,
+        info_list: list[tuple[int, int, int, int]],
+        info_holder: list[int],
+    ) -> None:
+        """Rewrite the tokens of one chunk into the per-request layout.
+
+        The layout is a per-request phase machine over logical positions:
+
+        - ``phase == "text"``: tokens get sequential logical positions from
+          ``next_text`` until the next SOI opens a block.
+        - ``phase == "vae"`` / ``"vit"``: the present section's tokens all
+          share the section anchor; VAE patch rows (the <|fim_middle|>
+          interior, excluding the SOI/EOI markers) are marked in
+          ``vae_mask``.
+        - when a block completes the layout's ``next_logical`` advances by 2
+          and the following text resumes sequentially; the completion /
+          prefill-done decision is made by the caller from the schedule.
+        """
+        n = end - start
+        if n <= 0:
+            return
+        device = new_positions.device
+        dtype = new_positions.dtype
+        section = ids_list[start:end] if ids_list is not None else None
+        pos = 0
+
+        # A chunk that starts mid-block is the continuation of a
+        # boundary-spanning block, so the encoder re-encoded it: the FIFO
+        # head may be a stale re-encode.  `_resolve_block_geometry` skips it
+        # once, only when this flag is set.
+        layout["_stale_possible"] = layout.get("phase") in ("vae", "vit")
+
+        def _block_anchor(layout: dict[str, object]) -> int:
+            return int(layout.get("next_logical", 0))
+
+        while pos < n:
+            phase = layout.get("phase")
+            if phase in ("vae", "vit"):
+                remaining = int(layout.get("_remaining", 0))
+                anchor = int(layout.get("_vae_anchor" if phase == "vae" else "_vit_anchor", 0))
+                take = min(remaining, n - pos)
+                if take > 0:
+                    new_positions[start + pos : start + pos + take] = anchor
+                    if phase == "vae":
+                        # Mark only the fim-patch interior (markers excluded).
+                        for i in range(take):
+                            tok = section[pos + i] if section is not None else self._img2img_token_id
+                            if tok == self._img2img_token_id:
+                                vae_mask[start + pos + i] = True
+                pos += take
+                remaining -= take
+                layout["_remaining"] = remaining
+                if phase == "vae":
+                    layout["_has_vae"] = True
+                if remaining <= 0:
+                    if phase == "vae":
+                        # VAE section complete -> enter ViT section at M+1.
+                        layout["phase"] = "vit"
+                        layout["_vit_anchor"] = anchor + 1
+                        layout["_remaining"] = int(layout.get("_num_vit", 0))
+                    else:
+                        # ViT section complete -> block done, text resumes at
+                        # M+2 with next_text synced to next_logical.
+                        layout["_last_completed_geometry"] = (
+                            int(layout.get("_num_vae", 0)),
+                            int(layout.get("_num_vit", 0)),
+                        )
+                        layout["next_logical"] = int(layout.get("next_logical", 0)) + 2
+                        layout["next_text"] = layout["next_logical"]
+                        layout["phase"] = "text"
+                        layout["_vae_anchor"] = None
+                        layout["_vit_anchor"] = None
+                        # The split-block bindings were consumed; any leftover
+                        # geometry is stale and must not satisfy a later
+                        # resolve (it would shadow a fresh FIFO entry for a
+                        # different-size next image).
+                        layout["_block_info"] = None
+                continue
+
+            # phase == "text"
+            if section is None:
+                # No ids (warmup): consume everything as text.
+                t0 = int(layout.get("next_text", 0))
+                new_positions[start + pos : end] = torch.arange(t0, t0 + (n - pos), device=device, dtype=dtype)
+                layout["next_text"] = t0 + (n - pos)
+                layout["next_logical"] = t0 + (n - pos)
+                pos = n
+                break
+
+            # Consume text until the next SOI (block start) or end.
+            nxt = pos
+            while nxt < n and section[nxt] != self._start_of_image_id:
+                nxt += 1
+            span_len = nxt - pos
+            if span_len > 0:
+                t0 = int(layout.get("next_text", 0))
+                new_positions[start + pos : start + nxt] = torch.arange(t0, t0 + span_len, device=device, dtype=dtype)
+                layout["next_text"] = t0 + span_len
+                layout["next_logical"] = t0 + span_len
+            pos = nxt
+            if pos >= n:
+                break
+            # section[pos] == SOI -> a block starts here.
+            num_vae, num_vit = self._resolve_block_geometry(layout, info_list, info_holder, start + pos)
+            if num_vae is None:
+                # No geometry for this block: leave as sequential (safety).
+                layout["next_text"] = int(layout.get("next_text", 0)) + 1
+                layout["next_logical"] = int(layout.get("next_logical", 0)) + 1
+                pos += 1
+                continue
+            layout["phase"] = "vae"
+            layout["_vae_anchor"] = _block_anchor(layout)
+            layout["_vit_anchor"] = _block_anchor(layout) + 1
+            layout["_num_vae"] = num_vae
+            layout["_num_vit"] = num_vit
+            layout["_remaining"] = num_vae
+            # (loop continues; next iteration consumes the VAE section)
+            continue
+
+    def _emit_layout_rope(
+        self,
+        layout: dict[str, object],
+        n_computed: int,
+        n_scheduled: int,
+        done: bool,
+    ) -> None:
+        """Append the ropes-pending entry for one segment in batch order
+        (1:1 with req order -- flush_pending_metadata maps index -> req_id).
+
+        Prefill segments emit the plain rope only; the FIRST DECODE step
+        (``done``) adds ``image_shape`` + ``prefill_position_count`` -
+        ``num_computed`` equals the true prompt length there.
+        ``flush_pending_metadata`` last-wins and its image_shape guard keep
+        that entry authoritative across the later plain decode ropes.
+        """
+        rope = int(layout.get("next_logical", 0))
+        if done:
+            self._ropes_pending.append(
+                {
+                    "ropes": [rope],
+                    "image_shape": list(layout["_last_img_shape"]),
+                    "prefill_position_count": int(n_computed),
+                }
+            )
+        else:
+            self._ropes_pending.append({"ropes": [rope]})
