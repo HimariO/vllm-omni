@@ -334,7 +334,7 @@ def _format_text2text_prompts(prompts):
 def _format_img2text_prompts(prompts, image):
     return [
         {
-            "prompt": f"{_IMAGE_PAD_BLOCK}{_IM_START}user\n{_official_text(p)}{_UNDERSTANDING_SUFFIX}",
+            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{_official_text(p)}{_UNDERSTANDING_SUFFIX}",
             "multi_modal_data": {"image": image},
             "modalities": ["text"],
             "mode": "understanding",
@@ -346,7 +346,7 @@ def _format_img2text_prompts(prompts, image):
 def _format_dense_detection_prompts(prompts, image):
     return [
         {
-            "prompt": f"{_IMAGE_PAD_BLOCK}{_IM_START}user\n{_official_text(p)}{_UNDERSTANDING_SUFFIX}",
+            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{_official_text(p)}{_UNDERSTANDING_SUFFIX}",
             "multi_modal_data": {"image": image},
             "modalities": ["text"],
             "mode": "dense_detection",
