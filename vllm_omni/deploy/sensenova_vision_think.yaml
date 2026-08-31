@@ -44,13 +44,13 @@ stages:
       # Upstream decodes greedily with NO logit post-processing at all
       # (Bagel.generate_text -> argmax; no temperature/top_p/top_k/repetition
       # anywhere).  top_k=1 + identity processors reproduce that exactly.
-      temperature: 0.1
+      temperature: 0.4
       top_p: 0.9
       top_k: 1
       max_tokens: 8192
       seed: 52
       detokenize: true
-      repetition_penalty: 1.03
+      repetition_penalty: 1.05
 
   - stage_id: 1
     # Must be explicit: unlike BAGEL (whose config.json model_type="bagel"
