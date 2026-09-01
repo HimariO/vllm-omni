@@ -188,8 +188,8 @@ def _sensenova_vit_resize_dims(vae_h: int, vae_w: int) -> tuple[int, int]:
 #         logger.debug("[SenseNova-Vision] using custom _navit_pos_encoding")
 #         table = self.position_embedding.weight  # (num_positions, dim)
 #         num_positions = table.shape[0]
-#         # grid_side = int(num_positions**0.5)
-#         grid_side = 70 # default for upstream `get_flattened_position_ids_extrapolate`
+#         grid_side = int(num_positions**0.5)
+#         # grid_side = SENSENOVA_VISION_DEFAULT_VIT_MAX_NUM_PATCH_PER_SIDE
 #         gh, gw = height // self.patch_size, width // self.patch_size
 #         if emb.shape[1] == num_positions and height == width and gh * gw == num_positions:
 #             # Exact-square full-grid feed: direct lookup and the stock early
@@ -593,7 +593,7 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
                 single_pv = torch.nn.functional.interpolate(
                     single_pv, size=(vit_h, vit_w), mode="bicubic", align_corners=False
                 )
-            features = self.vit_model(single_pv)
+            features = self.vit_model(single_pv, interpolate_pos_encoding=True)
             embed = self.connector(features)
             num_patches = embed.shape[1]
             hidden = embed.shape[2]
