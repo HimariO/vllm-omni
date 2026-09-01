@@ -44,6 +44,7 @@ from examples.offline_inference.sensenova_vision.end2end import (
     _format_think_img2img_prompts,
     _format_think_text2img_prompts,
     _format_think_text2text_prompts,
+    _official_text,
 )
 from vllm_omni.model_executor.models.bagel.bagel import Img2ImgProcessorItems
 
@@ -245,6 +246,35 @@ def test_dense_understanding_scaffolds(formatter):
     assert (num_pads, num_fims) == (1, 0)
 
 
+def test_official_text_drops_only_the_image_placeholder():
+    """_official_text must behave like upstream generate()'s split:
+    drop <image>, keep every other byte of the template."""
+    official_det = (
+        "<image> Please detect all instances of <p>bird</p>, <p>boat</p>, "
+        "<p>person</p>, <p>cell phone</p>, <p>backpack</p>, <p>handbag</p> in the "
+        "image. Output the results as a structured text list with each detection "
+        "including category and bounding box coordinates in <bbox> format."
+    )
+    assert _official_text(official_det).endswith("in <bbox> format.")
+    assert "<image>" not in _official_text(official_det)
+    # The detection scaffold carries the FULL official <p>/<bbox> template.
+    img = Image.new("RGB", (32, 32))
+    (p,) = _format_dense_detection_prompts([official_det], img)
+    assert "<p>bird</p>, <p>boat</p>" in p["prompt"]
+
+
+def test_official_seg_template_passes_through_verbatim():
+    """Regression for the {p} insertion bug: seg/gcg_seg use '<p>{}</p>' bodies
+    upstream; the port must pass the full sentence through, not a fragment."""
+    official_seg = (
+        "<image> Could you return the binary segmentation masks for the specified "
+        "categories: <p>person furthest to the right</p>?"
+    )
+    img = Image.new("RGB", (32, 32))
+    (p,) = _format_dense_detection_prompts([official_seg], img)
+    assert "<p>person furthest to the right</p>?" in p["prompt"]
+
+
 def test_text2img_scaffold():
     (p,) = _format_text2img_prompts(["a corgi astronaut"])
     num_pads, num_fims = _assert_prompt_matches_mm_data(p)
@@ -286,13 +316,27 @@ def test_recon3d_one_fim_per_view():
     assert p["modalities"] == ["img2img"]
 
 
+def test_mixed_prompt_carries_official_caption_text():
+    """The mixed/caption_generate user segment must be the FULL official caption
+    prompt (minus only <image>), matching upstream generate()'s enqueue."""
+    official_caption = (
+        "<image> Please briefly describe the contents of the image. Please respond "
+        "with interleaved segmentation masks for the corresponding parts of the "
+        "answer."
+    )
+    img = Image.new("RGB", (32, 32))
+    (p,) = _format_mixed_prompts([official_caption], img)
+    tail = f"{_IM_START}Please briefly describe the contents of the image. Please respond with interleaved segmentation masks for the corresponding parts of the answer.{_IM_END}{_IM_START}"
+    assert p["prompt"].endswith(tail)
+
+
 def test_mixed_scaffold_conditions_via_img2img():
     """mixed = one bos/eos-wrapped segment + trailing bare bos opener.
 
-    Upstream never emits chat role words; ``<|im_start|>/<|im_end|>`` ARE its
+    Upstream never emits chat role words; <|im_start|>/<|im_end|> ARE its
     bos/eos special tokens, wrapped exactly once per text segment, and caption
-    decoding starts from a freshly fed ``<|im_start|>`` (``prepare_start_tokens``).
-    So the scaffold must reproduce that layout — NOT open an assistant turn
+    decoding starts from a freshly fed <|im_start|> (prepare_start_tokens).
+    So the scaffold must reproduce that layout -- NOT open an assistant turn
     (role words are OOD -> truncated captions) and NOT end at <|im_end|> with
     no opener (sampling after EOS -> degenerate loops).
     """
