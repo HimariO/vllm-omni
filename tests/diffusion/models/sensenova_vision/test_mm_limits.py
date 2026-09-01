@@ -25,12 +25,14 @@ Worst-case token budget (stage 0, ``deploy/sensenova_vision.yaml`` has
 
     per img2img block (recon3d-size 512x512 input):
         VAE section  = (512/16)^2 + 2            =   1026 tokens
-        separator    =                              1 token
         ViT section  = (980/14)^2 + 2            =   4902 tokens  (fixed)
-        block total  =                             5929 tokens
-    10-image request (limit cap): 10 x 5929       =  59290 prompt tokens
+        block total  =                             5928 tokens
+    10-image request (limit cap): 10 x 5928       =  59280 prompt tokens
 
-A single block (5929) fits comfortably inside one 32768-token prefill step;
+(Upstream-exact layout: each section bracketed by SOI/EOI, sections ADJACENT
+-- no separator token appears in the sequence.)
+
+A single block (5928) fits comfortably inside one 32768-token prefill step;
 a full 10-image request exceeds one step and therefore progresses via vLLM's
 chunked prefill.  The limit stays a finite 10 (never ``None``) so mm memory
 profiling remains bounded.
@@ -139,8 +141,8 @@ def _make_processor(info):
 def _expected_img2img_block_len(h: int, w: int) -> tuple[int, int, int]:
     """(vae_total, vit_total, block_total) for an HxW img2img item.
 
-    Mirrors the resize arithmetic in ``_get_prompt_updates`` /
-    ``_resize_to_stride``.
+    Mirrors the BAGEL-BASE resize arithmetic; only used by the 2b test,
+    which exercises the base ``OmniBagelMultiModalProcessor`` expansion.
     """
     stride = LATENT_DOWNSAMPLE
     max_img_size = MAX_LATENT_SIZE * stride
@@ -261,6 +263,67 @@ def test_n_fim_middle_placeholders_produce_n_blocks(tokenizer, hf_config, info_c
         assert mask[vae_total + 1 :].all(), "ViT section must be embedded"
 
 
+def test_sensenova_img2img_expansion_is_upstream_exact(tokenizer, hf_config, info_ctx):
+    """The SenseNova override must emit SOI/EOI-bracketed ADJACENT sections.
+
+    Regression guard for the upstream-exact relayout AND for bugs that only
+    manifest inside the subclass closure (e.g. a NameError there): unlike
+    2a/2b above, this drives the *subclass* processor expansion directly.
+    """
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        OmniSenseNovaVisionMultiModalProcessor,
+        OmniSenseNovaVisionProcessingInfo,
+        _sensenova_vae_resize_dims,
+        _sensenova_vit_resize_dims,
+    )
+
+    h, w = 375, 500  # non-square -> resize arithmetic actually exercised
+    image = Image.new("RGB", (w, h))
+    mm_items = MultiModalDataItems({"img2img": bagel_module.Img2ImgProcessorItems([image])})
+
+    info = OmniSenseNovaVisionProcessingInfo(info_ctx)
+    proc = object.__new__(OmniSenseNovaVisionMultiModalProcessor)
+    proc.info = info
+    proc.dummy_inputs = None
+    proc.cache = None
+    proc.data_parser = info.get_data_parser()
+
+    updates = proc._get_prompt_updates(mm_items, {}, MultiModalKwargsItems())
+    mm_prompt_updates = proc._bind_and_group_updates(updates, mm_items.get_all_counts())
+    prompt_ids = [tokenizer.convert_tokens_to_ids("<|fim_middle|>")]
+    _new_ids, placeholders = proc._apply_prompt_updates(prompt_ids, mm_prompt_updates)
+
+    (ph,) = placeholders["img2img"]
+    vocab = tokenizer.get_vocab()
+    soi_id, eoi_id = vocab["<|vision_start|>"], vocab["<|vision_end|>"]
+    fim_id = vocab["<|fim_middle|>"]
+
+    # Official two-stage transform: VAE resize, then ViT resize OF THE VAE-
+    # RESIZED image.  The ViT count follows aspect ratio (upstream
+    # ImageTransform(980, 224, 14)), NOT the fixed 70x70 square.
+    new_h, new_w = _sensenova_vae_resize_dims(h, w)
+    vit_h, vit_w = _sensenova_vit_resize_dims(new_h, new_w)
+    num_vae_patches = (new_h // LATENT_DOWNSAMPLE) * (new_w // LATENT_DOWNSAMPLE)
+    num_vit_patches = (vit_h // 14) * (vit_w // 14)
+    assert num_vit_patches <= VIT_MAX_NUM_PATCH_PER_SIDE**2, "aspect grid must stay within the 70x70 cap"
+    num_vae, num_vit = num_vae_patches + 2, num_vit_patches + 2
+
+    assert ph.length == num_vae + num_vit, "VAE/ViT sections must be ADJACENT (no separator token)"
+    tokens = ph.tokens
+    assert tokens[0] == soi_id and tokens[num_vae - 1] == eoi_id, "VAE section must be SOI-bracketed"
+    assert tokens[num_vae] == soi_id and tokens[-1] == eoi_id, "ViT section must be SOI-bracketed"
+    assert all(t == fim_id for t in tokens[1 : num_vae - 1]), "VAE interior must be fim placeholders"
+    assert all(t == fim_id for t in tokens[num_vae + 1 : -1]), "ViT interior must be fim placeholders"
+
+    # EVERY slot carries an embedding: _process_img2img_input builds the full
+    # combined tensor [se, vae..., ee, se, vit..., ee], and vLLM's engine maps
+    # placeholder positions to embedding rows by the RUNNING COUNT of
+    # is_embed=True slots -- a False slot interleaved INSIDE the block would
+    # shift every later embedding onto the wrong token (out_10 corruption).
+    assert ph.is_embed is None or bool(ph.is_embed.all()), "all expanded slots must be marked embedded"
+    assert tokenizer.convert_tokens_to_ids("<|fim_middle|>") == fim_id
+
+
 # ---------------------------------------------------------------------------
 # 2c. _adjust_positions_for_img2img + MoT routing with TWO img2img blocks
 # ---------------------------------------------------------------------------
@@ -269,37 +332,61 @@ def test_n_fim_middle_placeholders_produce_n_blocks(tokenizer, hf_config, info_c
 class _PositionAdjustStub:
     """Carries exactly the state ``_adjust_positions_for_img2img`` touches."""
 
-    def __init__(self, pending_infos, img2img_token_id):
+    def __init__(self, pending_infos, start_of_image_id, end_of_image_id, img2img_token_id):
         self._pending_img2img_info = list(pending_infos)
         self._last_img2img_info = None
         self._ropes_pending = []
+        self._start_of_image_id = start_of_image_id
+        self._end_of_image_id = end_of_image_id
         self._img2img_token_id = img2img_token_id
         self._vae_token_mask = None
         self._has_vae_tokens = False
         self._has_non_vae_tokens = True
+        self._img2img_layouts = {}
+        self._step_req_schedule = []
+        # Bind the per-request helper methods so the state machine calls on
+        # ``self`` resolve against the stub (the production model carries
+        # them as bound methods on the class).
+        from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+            OmniSenseNovaVisionForConditionalGeneration,
+        )
+
+        for _name in (
+            "_match_leading_blocks",
+            "_enter_layout_from_span",
+            "_resolve_block_geometry",
+            "_collapse_chunk_into_layout",
+            "_emit_layout_rope",
+        ):
+            fn = getattr(OmniSenseNovaVisionForConditionalGeneration, _name)
+            setattr(self, _name, fn.__get__(self))
 
 
-def _two_block_ids(fim_id: int) -> tuple[list[int], int, int]:
+def _two_block_ids(soi_id: int, fim_id: int, eoi_id: int) -> tuple[list[int], int, int]:
     """One request: pre-text(2) + block1 + gap-text(2) + block2 + post-text(2).
 
-    Each block carries (num_vae=6, num_vit=8): a 6-token VAE section
-    (start marker + 4 latent patches + end marker), 1 separator, and an
-    8-token ViT section (markers + 6 patches) -- matching the embed-side
-    layout ``[se, vae..., ee, se, vit..., ee]`` with every block token
-    rendered as <|fim_middle|>.
+    Each block carries (num_vae=6, num_vit=8) in the upstream-exact layout:
+    ``[SOI] 4 latent patches [EOI] [SOI] 6 patches [EOI]`` -- ADJACENT
+    sections, NO separator -- with <|fim_middle|> placeholders standing in
+    for every patch slot, matching the embed-side layout
+    ``[se, vae..., ee, se, vit..., ee]``.
     """
     num_vae, num_vit = 6, 8
-    block = [fim_id] * (num_vae + 1 + num_vit)
+    block = [soi_id] + [fim_id] * (num_vae - 2) + [eoi_id] + [soi_id] + [fim_id] * (num_vit - 2) + [eoi_id]
     ids = [11, 22] + block + [33, 44] + block + [55, 66]
     return ids, num_vae, num_vit
 
 
 def test_adjust_positions_handles_two_img2img_blocks_in_one_request(tokenizer):
-    fim_id = tokenizer.convert_tokens_to_ids("<|fim_middle|>")
-    ids, num_vae, num_vit = _two_block_ids(fim_id)
+    vocab = tokenizer.get_vocab()
+    soi_id = vocab["<|vision_start|>"]
+    eoi_id = vocab["<|vision_end|>"]
+    fim_id = vocab["<|fim_middle|>"]
+    ids, num_vae, num_vit = _two_block_ids(soi_id, fim_id, eoi_id)
     infos = [(num_vae, num_vit, 512, 512), (num_vae, num_vit, 512, 512)]
 
-    stub = _PositionAdjustStub(infos, fim_id)
+    stub = _PositionAdjustStub(infos, soi_id, eoi_id, fim_id)
+    stub._step_req_schedule = [("r1", 0, len(ids))]
     from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
         OmniSenseNovaVisionForConditionalGeneration,
     )
@@ -308,14 +395,15 @@ def test_adjust_positions_handles_two_img2img_blocks_in_one_request(tokenizer):
     out = adjust(stub, torch.arange(len(ids)), torch.tensor(ids))
     got = out.tolist()
 
-    # Layout: pre(2) | blk1 @ [2,17) | gap(2) @ [17,19) | blk2 @ [19,34) | post(2)
-    # Each block: VAE+separator share the current text slot M, ViT shares
-    # M+1, and the following text resumes sequentially at M+2.
+    # Layout: pre(2) | blk1 @ [2,16) | gap(2) @ [16,18) | blk2 @ [18,32) | post(2)
+    # Each 14-token block: VAE section (SOI marker incl.) shares the current
+    # text slot M, ViT section shares M+1, and the following text resumes
+    # sequentially at M+2.
     m1, m2 = 2, 6  # text counters when each block starts
     expected = [0, 1]
-    expected += [m1] * (num_vae + 1) + [m1 + 1] * num_vit  # block 1
+    expected += [m1] * num_vae + [m1 + 1] * num_vit  # block 1
     expected += [m1 + 2, m1 + 3]  # inter-block text continues sequentially
-    expected += [m2] * (num_vae + 1) + [m2 + 1] * num_vit  # block 2
+    expected += [m2] * num_vae + [m2 + 1] * num_vit  # block 2
     expected += [m2 + 2, m2 + 3]  # trailing text
     assert got == expected, (
         "both img2img blocks must get shared VAE/ViT positions; "
@@ -325,33 +413,44 @@ def test_adjust_positions_handles_two_img2img_blocks_in_one_request(tokenizer):
     # MoT routing: latent patches of BOTH blocks route through moe_gen.
     mask = stub._vae_token_mask
     assert mask is not None and stub._has_vae_tokens
-    b1_latent = list(range(2 + 1, 2 + num_vae - 1))  # strip start/end markers
-    b2_latent = list(range(19 + 1, 19 + num_vae - 1))
+    b1_latent = list(range(2 + 1, 2 + num_vae - 1))  # between block 1's markers
+    b2_latent = list(range(18 + 1, 18 + num_vae - 1))  # between block 2's markers
     assert all(mask[i] for i in b1_latent + b2_latent), mask.int().tolist()
     assert not mask[0] and not mask[-1], "text tokens must not be VAE-masked"
-    assert not mask[2] and not mask[8], "block 1 marker/separator must not be VAE-masked"
-    assert not mask[19] and not mask[25], "block 2 marker/separator must not be VAE-masked"
+    assert not any(mask[i] for i in (2, 7, 8, 13)), "block 1 SOI/EOI markers must not be VAE-masked"
+    assert not any(mask[i] for i in (18, 23, 24, 29)), "block 2 SOI/EOI markers must not be VAE-masked"
     assert stub._has_non_vae_tokens
 
-    # Exactly one ropes entry per request (flush_pending_metadata maps batch
-    # order -> req_ids), carrying the FINAL continuation rope and the last
-    # block's image shape.
-    assert len(stub._ropes_pending) == 1
-    meta = stub._ropes_pending[0]
+    # The PREFILL chunk (whole prompt in one step) emits only the continuation
+    # rope (flush_pending_metadata last-wins keeps the later decode entry).
+    assert stub._ropes_pending == [{"ropes": [m2 + 4]}]
+    assert stub._pending_img2img_info == []
+    # The layout survives prefill so the FIRST DECODE step can emit the full
+    # metadata (prefill_position_count == num_computed == prompt_len there).
+    assert "r1" in stub._img2img_layouts
+
+    stub._step_req_schedule = [("r1", len(ids), 1)]
+    adjust(stub, torch.tensor([len(ids)]), torch.tensor([77]))
+    assert len(stub._ropes_pending) == 2
+    meta = stub._ropes_pending[-1]
     assert meta["ropes"] == [m2 + 4]
     assert meta["image_shape"] == [512, 512]
     assert meta["prefill_position_count"] == len(ids)
-    assert stub._pending_img2img_info == []
+    assert stub._img2img_layouts == {}, "layout must be pruned at first decode"
 
 
 def test_adjust_positions_single_block_unchanged(tokenizer):
-    """Guard: the multi-block fix must not alter single-block results."""
-    fim_id = tokenizer.convert_tokens_to_ids("<|fim_middle|>")
+    """Guard: the upstream-exact relayout must not alter single-block results."""
+    vocab = tokenizer.get_vocab()
+    soi_id = vocab["<|vision_start|>"]
+    eoi_id = vocab["<|vision_end|>"]
+    fim_id = vocab["<|fim_middle|>"]
     num_vae, num_vit = 6, 8
-    block = [fim_id] * (num_vae + 1 + num_vit)
+    block = [soi_id] + [fim_id] * (num_vae - 2) + [eoi_id] + [soi_id] + [fim_id] * (num_vit - 2) + [eoi_id]
     ids = [7, 8, 9] + block + [10, 11]
 
-    stub = _PositionAdjustStub([(num_vae, num_vit, 512, 512)], fim_id)
+    stub = _PositionAdjustStub([(num_vae, num_vit, 512, 512)], soi_id, eoi_id, fim_id)
+    stub._step_req_schedule = [("r1", 0, len(ids))]
     from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
         OmniSenseNovaVisionForConditionalGeneration,
     )
@@ -360,11 +459,218 @@ def test_adjust_positions_single_block_unchanged(tokenizer):
     out = adjust(stub, torch.arange(len(ids)), torch.tensor(ids))
 
     m = 3
-    expected = [0, 1, 2] + [m] * (num_vae + 1) + [m + 1] * num_vit + [m + 2, m + 3]
+    expected = [0, 1, 2] + [m] * num_vae + [m + 1] * num_vit + [m + 2, m + 3]
     assert out.tolist() == expected
-    assert stub._ropes_pending == [{"ropes": [m + 4], "image_shape": [512, 512], "prefill_position_count": len(ids)}]
+    # Prefill emits the plain continuation rope; the decode step carries the
+    # full metadata (prefill_position_count == num_computed == prompt_len).
+    assert stub._ropes_pending == [{"ropes": [m + 4]}]
     mask = stub._vae_token_mask
     assert all(mask[i] for i in range(m + 1, m + num_vae - 1))
+
+    stub._step_req_schedule = [("r1", len(ids), 1)]
+    adjust(stub, torch.tensor([len(ids)]), torch.tensor([77]))
+    assert stub._ropes_pending[-1] == {
+        "ropes": [m + 4],
+        "image_shape": [512, 512],
+        "prefill_position_count": len(ids),
+    }
+    assert stub._img2img_layouts == {}
+
+
+def _block_ids(soi_id: int, fim_id: int, eoi_id: int, num_vae: int = 6, num_vit: int = 8) -> list[int]:
+    """One full img2img block (default 6+8 geometry), upstream-exact layout."""
+    return [soi_id] + [fim_id] * (num_vae - 2) + [eoi_id] + [soi_id] + [fim_id] * (num_vit - 2) + [eoi_id]
+
+
+def _split_chunks(ids: list[int], cut: int) -> tuple[list[int], list[int]]:
+    """Split token ids into (pre, post) at a token boundary (offset cut)."""
+    return ids[:cut], ids[cut:]
+
+
+def test_adjust_positions_split_block_spans_two_chunks(tokenizer):
+    """Bug C: a block split by chunked prefill must be collapsed correctly.
+
+    Chunk 1 ends inside the VAE section; chunk 2 begins inside it.  The
+    encoder re-encodes the split block, so its info is refilled at the
+    continuation chunk's FIFO head.  The layout persists in one stub across
+    both calls (as it does in the model across forward() steps)."""
+    vocab = tokenizer.get_vocab()
+    soi_id = vocab["<|vision_start|>"]
+    eoi_id = vocab["<|vision_end|>"]
+    fim_id = vocab["<|fim_middle|>"]
+    num_vae, num_vit = 6, 8
+    block = _block_ids(soi_id, fim_id, eoi_id, num_vae, num_vit)
+    ids = [7, 8] + block + [9, 10]
+    # Cut inside the VAE section: pre-text(2) + SOI + 2 fim patches.
+    cut = 2 + 1 + 2  # 5 tokens, ends inside the VAE interior
+    pre, post = _split_chunks(ids, cut)
+    assert len(pre) == 5 and pre[:2] == [7, 8] and pre[2] == soi_id
+    assert pre[3] == fim_id and pre[4] == fim_id and post[0] == fim_id
+
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        OmniSenseNovaVisionForConditionalGeneration,
+    )
+
+    adjust = OmniSenseNovaVisionForConditionalGeneration._adjust_positions_for_img2img
+
+    stub = _PositionAdjustStub([(num_vae, num_vit, 512, 512)], soi_id, eoi_id, fim_id)
+
+    # Chunk 1: window ends mid-VAE (partial block).
+    stub._step_req_schedule = [("r1", 0, len(pre))]
+    out1 = adjust(stub, torch.arange(len(ids)), torch.tensor(pre)).tolist()[: len(pre)]
+    assert out1[:2] == [0, 1], out1
+    assert all(v == 2 for v in out1[2:]), out1  # partial VAE (SOI+2 patches) share M=2
+
+    # Chunk 2: continuation.  The encoder re-encodes the split block: stale
+    # info at the FIFO head; the layout keeps the in-progress block geometry.
+    stub._pending_img2img_info = [(num_vae, num_vit, 512, 512)]
+    stub._step_req_schedule = [("r1", len(pre), len(post))]
+    out2 = adjust(stub, torch.arange(len(pre), len(ids)), torch.tensor(post)).tolist()
+
+    m = 2
+    # Chunk 2 consumes: 3 remaining VAE tokens (fim, fim, eoi) -> M, then the
+    # 8-token ViT section -> M+1, then trailing text -> M+2, M+3.
+    vae_consumed_1 = 3  # SOI + 2 fim patches in chunk 1
+    expected2 = [m] * (num_vae - vae_consumed_1)
+    expected2 += [m + 1] * num_vit
+    expected2 += [m + 2, m + 3]
+    assert len(expected2) == len(post), (len(expected2), len(post))
+    assert out2 == expected2, f"chunk2: {out2}"
+
+    combined = out1 + out2
+    expected_full = [0, 1] + [m] * num_vae + [m + 1] * num_vit + [m + 2, m + 3]
+    assert combined == expected_full, f"combined: {combined}"
+
+    # The stale re-encode is consumed by the harness via ``_pending
+    # _img2img_info`` hand-in; correctness follows from the layout phase
+    # machine, not from FIFO accounting, so nothing else needs to remain.
+
+
+def test_adjust_positions_chunked_multi_block_continuation(tokenizer):
+    """A two-block request split across three chunks must match single-chunk.
+
+    Chunk1: pre-text + block1 (complete) + partial VAE of block2.
+    Chunk2: rest of block2's VAE (stale re-encode at FIFO head).
+    Chunk3: rest of block2's ViT + trailing text (prefill done)."""
+    vocab = tokenizer.get_vocab()
+    soi_id = vocab["<|vision_start|>"]
+    eoi_id = vocab["<|vision_end|>"]
+    fim_id = vocab["<|fim_middle|>"]
+    num_vae, num_vit = 6, 8
+    block = _block_ids(soi_id, fim_id, eoi_id, num_vae, num_vit)
+    ids = [11, 22] + block + block + [33, 44]
+
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        OmniSenseNovaVisionForConditionalGeneration,
+    )
+
+    adjust = OmniSenseNovaVisionForConditionalGeneration._adjust_positions_for_img2img
+
+    # Single-chunk reference.
+    ref = _PositionAdjustStub([(num_vae, num_vit, 512, 512)] * 2, soi_id, eoi_id, fim_id)
+    ref._step_req_schedule = [("r1", 0, len(ids))]
+    ref_out = adjust(ref, torch.arange(len(ids)), torch.tensor(ids)).tolist()
+
+    # Three chunks: cut1 ends inside VAE of block2; cut2 ends block2's VAE.
+    cut1 = 2 + (num_vae + num_vit) + (1 + 3)  # pre + blk1 + 4 tokens of blk2 VAE
+    cut2 = 2 + (num_vae + num_vit) + num_vae  # pre + blk1 + full blk2 VAE
+    c1, rest = _split_chunks(ids, cut1)
+    c2, c3 = _split_chunks(rest, cut2 - cut1)
+
+    stub = _PositionAdjustStub([], soi_id, eoi_id, fim_id)
+    combined = []
+    comp = 0
+    for i, chunk in enumerate((c1, c2, c3)):
+        if i == 0:
+            stub._pending_img2img_info = [(num_vae, num_vit, 512, 512)] * 2
+        else:
+            # The encoder re-encodes block2 in each continuation chunk.
+            stub._pending_img2img_info = [(num_vae, num_vit, 512, 512)]
+        stub._step_req_schedule = [("r1", comp, len(chunk))]
+        seg_out = adjust(stub, torch.arange(comp, comp + len(chunk)), torch.tensor(chunk)).tolist()
+        combined += seg_out
+        comp += len(chunk)
+
+    assert combined == ref_out, f"chunked {combined} != single-chunk {ref_out}"
+
+    # Every prefill chunk emits a plain rope; the layout persists until the
+    # FIRST DECODE step, whose entry carries the full metadata.
+    assert stub._ropes_pending, "must have rope entries"
+    assert all("image_shape" not in m for m in stub._ropes_pending), stub._ropes_pending
+    assert "r1" in stub._img2img_layouts
+
+    stub._step_req_schedule = [("r1", len(ids), 1)]
+    adjust(stub, torch.tensor([len(ids)]), torch.tensor([77]))
+    final_meta = stub._ropes_pending[-1]
+    assert final_meta["image_shape"] == [512, 512]
+    assert final_meta["prefill_position_count"] == len(ids)
+    assert stub._img2img_layouts == {}
+
+
+def test_adjust_positions_mixed_img2img_text_batch(tokenizer):
+    """Batch of (img2img, text-only, img2img) must map ropes 1:1 in order."""
+    vocab = tokenizer.get_vocab()
+    soi_id = vocab["<|vision_start|>"]
+    eoi_id = vocab["<|vision_end|>"]
+    fim_id = vocab["<|fim_middle|>"]
+    num_vae, num_vit = 6, 8
+    block = _block_ids(soi_id, fim_id, eoi_id, num_vae, num_vit)
+
+    a_ids = [1, 2] + block + [3]  # img2img request
+    b_ids = [10, 20, 30]  # text-only sibling
+    c_ids = [5] + block + [6, 7]  # second img2img (different shape)
+
+    ab = a_ids + b_ids + c_ids
+    infos = [(num_vae, num_vit, 512, 512), (num_vae, num_vit, 256, 384)]
+    # Each request's positions are its OWN sequence (0-based), concatenated.
+    positions = list(range(len(a_ids))) + list(range(len(b_ids))) + list(range(len(c_ids)))
+
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        OmniSenseNovaVisionForConditionalGeneration,
+    )
+
+    adjust = OmniSenseNovaVisionForConditionalGeneration._adjust_positions_for_img2img
+
+    stub = _PositionAdjustStub(infos, soi_id, eoi_id, fim_id)
+    stub._step_req_schedule = [
+        ("a", 0, len(a_ids)),
+        ("b", 0, len(b_ids)),
+        ("c", 0, len(c_ids)),
+    ]
+    out = adjust(stub, torch.tensor(positions), torch.tensor(ab)).tolist()
+
+    a_expected = [0, 1] + [2] * num_vae + [3] * num_vit + [4]
+    b_expected = [0, 1, 2]
+    c_expected = [0] + [1] * num_vae + [2] * num_vit + [3, 4]
+    assert out == a_expected + b_expected + c_expected, out
+
+    # Prefill: ONE plain rope per request in batch order.
+    assert len(stub._ropes_pending) == 3, stub._ropes_pending
+    assert stub._ropes_pending[0] == {"ropes": [5]}
+    assert stub._ropes_pending[1] == {"ropes": [3]}, "text-only sibling plain rope"
+    assert stub._ropes_pending[2] == {"ropes": [5]}
+    assert set(stub._img2img_layouts) == {"a", "c"}
+
+    # First decode step: img2img requests emit the full metadata (rope +
+    # image_shape + prefill_position_count == num_computed == prompt_len);
+    # the text-only sibling stays plain; layouts are pruned.
+    stub._step_req_schedule = [
+        ("a", len(a_ids), 1),
+        ("b", len(b_ids), 1),
+        ("c", len(c_ids), 1),
+    ]
+    decode_positions = [len(a_ids), len(b_ids), len(c_ids)]
+    adjust(stub, torch.tensor(decode_positions), torch.tensor([77, 78, 79]))
+    assert len(stub._ropes_pending) == 6, stub._ropes_pending
+    assert stub._ropes_pending[3] == {
+        "ropes": [5],
+        "image_shape": [512, 512],
+        "prefill_position_count": len(a_ids),
+    }
+    assert stub._ropes_pending[4] == {"ropes": [4]}, "text-only sibling decode plain rope"
+    assert stub._ropes_pending[5]["image_shape"] == [256, 384]
+    assert stub._ropes_pending[5]["prefill_position_count"] == len(c_ids)
+    assert stub._img2img_layouts == {}
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +760,167 @@ def test_img2img_batch_flattens_leading_batch_dim():
 
 
 # ---------------------------------------------------------------------------
+# 2e. SigLIP pos rows for aspect-preserving ViT grids (navit-exact lookup)
+# ---------------------------------------------------------------------------
+
+
+class _CallableTable:
+    """Stand-in for ``nn.Embedding``: indexable-callable around a raw table
+    (the real module is called as ``position_embedding(position_ids)`` AND
+    read as ``position_embedding.weight``)."""
+
+    def __init__(self, table: torch.Tensor):
+        self.weight = table
+
+    def __call__(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.weight[ids]
+
+
+def _make_siglip_embeddings_stub(grid: int, dim: int, patch_size: int):
+    """A minimal stand-in for vLLM's SiglipVisionEmbeddings with the SAME
+    attribute surface the real module exposes (call-and-weight position
+    embedding table, position_ids buffer, patch_size)."""
+    from types import SimpleNamespace
+
+    table = torch.randn(grid * grid, dim)
+    emb = SimpleNamespace(
+        position_embedding=_CallableTable(table),
+        position_ids=torch.arange(grid * grid).unsqueeze(0),
+        patch_size=patch_size,
+    )
+
+    def _broken_interp(self, embeddings, height, width):
+        # Faithful copy of the BUGGY line in vllm's siglip.py:322:
+        # sqrt of weight.shape[1] (hidden size) instead of shape[0].
+        num_patches = embeddings.shape[1]
+        num_positions = self.position_embedding.weight.shape[1]  # BUG
+        if num_patches == num_positions and height == width:
+            return self.position_embedding(self.position_ids)
+        raise RuntimeError("shape mismatch should have happened before this")
+
+    emb.interpolate_pos_encoding = _broken_interp.__get__(emb)
+    return emb
+
+
+def test_fix_siglip_pos_encoding_aspect_grid_exact_rows():
+    """_fix_siglip_pos_encoding must bind the navit-EXACT lookup: for any
+    aspect grid <= 70x70, position rows come straight from the trained table
+    at ids h*70 + w -- NEVER bicubic resampling (siglip_navit never
+    interpolates; blended rows are OOD poison, see out_13).  The pre-fix
+    vLLM implementation additionally crashed on non-square feeds (sqrt of
+    the HIDDEN size ~= 33 reshape)."""
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        _fix_siglip_pos_encoding,
+    )
+
+    emb = _make_siglip_embeddings_stub(70, 1152, patch_size=14)
+    assert _fix_siglip_pos_encoding(emb), "fixture must be recognized and patched"
+
+    # Non-square ASPECT feed: 37 x 37 in this symmetric case; the ROW ORDER
+    # is what matters and is asserted below with distinct row content.
+    gh = gw = 37
+    feed = torch.randn(1, gh * gw, 1152)
+    out = emb.interpolate_pos_encoding(feed, gh * 14, gw * 14)
+    assert out.shape == (1, gh * gw, 1152)
+    # Every returned row must BE a raw trained row (no blending): the packed
+    # sequence of ids h*70 + w.
+    table = emb.position_embedding.weight
+    ids = (torch.arange(gh)[:, None] * 70 + torch.arange(gw)).reshape(-1)
+    assert torch.equal(out[0], table[ids]), "pos rows must be exact trained-table lookups"
+
+
+def test_fix_siglip_pos_encoding_aspect_rect_rows():
+    """True rectangular grid (gcg_seg profile: taller than wide): rows follow
+    h-major order into the square trained table."""
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        _fix_siglip_pos_encoding,
+    )
+
+    emb = _make_siglip_embeddings_stub(70, 1152, patch_size=14)
+    assert _fix_siglip_pos_encoding(emb)
+    gh, gw = 37, 49
+    feed = torch.randn(1, gh * gw, 1152)
+    out = emb.interpolate_pos_encoding(feed, gh * 14, gw * 14)
+    assert out.shape == (1, gh * gw, 1152)
+    table = emb.position_embedding.weight
+    ids = (torch.arange(gh)[:, None] * 70 + torch.arange(gw)).reshape(-1)
+    assert torch.equal(out[0], table[ids])
+
+
+def test_fix_siglip_pos_encoding_rejects_oversized_grid():
+    """No rows exist beyond 70x70; an oversized grid must fail loudly
+    instead of silently indexing garbage."""
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        _fix_siglip_pos_encoding,
+    )
+
+    emb = _make_siglip_embeddings_stub(70, 1152, patch_size=14)
+    assert _fix_siglip_pos_encoding(emb)
+    with pytest.raises(RuntimeError, match="exceeds the learned position table"):
+        emb.interpolate_pos_encoding(torch.randn(1, 71 * 71, 1152), 71 * 14, 71 * 14)
+
+
+def test_fix_siglip_pos_encoding_square_feed_uses_table_directly():
+    """The early-return branch must remain: square + matching grid returns
+    the raw position embedding rows unchanged."""
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        _fix_siglip_pos_encoding,
+    )
+
+    emb = _make_siglip_embeddings_stub(70, 1152, patch_size=14)
+    assert _fix_siglip_pos_encoding(emb)
+    feed = torch.randn(1, 4900, 1152)
+    out = emb.interpolate_pos_encoding(feed, 980, 980)
+    assert torch.equal(out, emb.position_embedding.weight.unsqueeze(0))
+
+
+def test_fix_siglip_pos_encoding_idempotent():
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        _fix_siglip_pos_encoding,
+    )
+
+    emb = _make_siglip_embeddings_stub(70, 1152, patch_size=14)
+    assert _fix_siglip_pos_encoding(emb)
+    bound_method = emb.interpolate_pos_encoding
+    assert _fix_siglip_pos_encoding(emb)
+    assert emb.interpolate_pos_encoding is bound_method, "must not rebind on a second call"
+
+
+def test_stock_vllm_interpolation_crashes_on_aspect_grid():
+    """Documentation-by-test: the STOCK vllm SiglipVisionEmbeddings raises
+    exactly the profile-run error on any non-square feed.  This pins WHY we
+    need _fix_siglip_pos_encoding bound before the first img2img request."""
+    try:
+        from vllm.model_executor.models.siglip import SiglipVisionEmbeddings
+    except ImportError:  # pragma: no cover
+        pytest.skip("vllm siglip module unavailable")
+
+    cfg = SimpleNamespace(
+        hidden_size=1152,
+        image_size=980,
+        patch_size=14,
+        num_channels=3,
+    )
+    # A bare-shell SiglipVisionEmbeddings: init ONLY enough nn.Module state
+    # (no weights loaded) to attach the position-embedding submodule.
+    emb = object.__new__(SiglipVisionEmbeddings)
+    torch.nn.Module.__init__(emb)
+    emb.config = cfg
+    emb.embed_dim = cfg.hidden_size
+    emb.image_size = cfg.image_size
+    emb.patch_size = cfg.patch_size
+    emb.num_patches = (cfg.image_size // cfg.patch_size) ** 2
+    emb.num_positions = emb.num_patches
+    emb.position_embedding = torch.nn.Embedding(emb.num_positions, cfg.hidden_size)
+    emb.register_buffer("position_ids", torch.arange(emb.num_positions).unsqueeze(0))
+
+    # 37x37 non-square feed -> stock code reshapes to sqrt(hidden)=33 -> boom.
+    feed = torch.randn(1, 37 * 37, 1152)
+    with pytest.raises(RuntimeError, match="invalid for input of size"):
+        emb.interpolate_pos_encoding(feed, 37 * 14, 37 * 14)
+
+
+# ---------------------------------------------------------------------------
 # 3. Worst-case token budget arithmetic
 # ---------------------------------------------------------------------------
 
@@ -461,20 +928,31 @@ def test_img2img_batch_flattens_leading_batch_dim():
 def test_worst_case_token_budget_arithmetic():
     """Documented budget for the limit=10 cap (see module docstring).
 
-    A single recon3d-size block (5929 tokens) must fit inside one stage-0
-    prefill step (``max_num_batched_tokens: 32768``); a full 10-image request
-    (59290 tokens) exceeds one step and progresses via chunked prefill.
+    A single recon3d-size block (5928 tokens, upstream-exact layout with
+    ADJACENT SOI/EOI-bracketed sections and no separator) must fit inside
+    one stage-0 prefill step (``max_num_batched_tokens: 32768``); a full
+    10-image request (59280 tokens) exceeds one step and progresses via
+    chunked prefill.
     """
-    vae_total, vit_total, block_total = _expected_img2img_block_len(512, 512)
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        _sensenova_vae_resize_dims,
+    )
+
+    new_h, new_w = _sensenova_vae_resize_dims(512, 512)
+    assert (new_h, new_w) == (512, 512)
+    num_vae_patches = (new_h // LATENT_DOWNSAMPLE) * (new_w // LATENT_DOWNSAMPLE)
+    vae_total = num_vae_patches + 2  # + SOI/EOI markers
+    vit_total = VIT_PATCH_TOTAL  # 4902, markers included
+    block_total = vae_total + vit_total  # sections ADJACENT, no separator
     assert (vae_total, vit_total) == (1026, 4902)
-    assert block_total == 5929
+    assert block_total == 5928
 
     stage0_step_budget = 32768  # deploy/sensenova_vision.yaml stages[0]
     assert block_total < stage0_step_budget, "one img2img block must fit in a single prefill step"
 
     limit = 10
     worst_case_prompt_tokens = limit * block_total
-    assert worst_case_prompt_tokens == 59290
+    assert worst_case_prompt_tokens == 59280
     # The cap must stay finite so mm profiling allocates a bounded dummy
     # batch (never unbounded/None).
     assert isinstance(limit, int) and limit > 0
