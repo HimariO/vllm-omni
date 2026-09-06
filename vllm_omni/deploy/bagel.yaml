@@ -10,7 +10,11 @@ async_chunk: false
 
 stages:
   - stage_id: 0
-    max_num_batched_tokens: 10000
+    # vLLM only asks the model for RoPE positions (get_mrope_input_positions) when the config declares mrope_section
+    hf_overrides:
+      rope_parameters: {rope_type: default, mrope_section: [16, 24, 24]}
+    limit_mm_per_prompt: {image: 4}
+    max_num_batched_tokens: 32768
     max_num_seqs: 3
     # gpu_memory_utilization: 0.45
     trust_remote_code: true
