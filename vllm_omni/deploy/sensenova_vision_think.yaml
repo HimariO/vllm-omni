@@ -34,6 +34,8 @@ pipeline: sensenova_vision_think
 
 stages:
   - stage_id: 0
+    hf_overrides:
+        rope_parameters: {rope_type: default, mrope_section: [16, 24, 24]}
     max_num_batched_tokens: 32768
     max_num_seqs: 3
     gpu_memory_utilization: 0.45

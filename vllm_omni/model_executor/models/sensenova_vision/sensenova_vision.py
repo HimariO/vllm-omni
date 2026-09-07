@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-Vision-7B-MoT omni model.
 
 SenseNova-Vision is a fork of Bagel with identical parameter-bearing modules.
@@ -13,14 +13,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 import torch
-from transformers import BatchFeature
+
+# from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalKwargsItems
-from vllm.multimodal.parse import ImageEmbeddingItems, ImageProcessorItems, MultiModalDataItems
-from vllm.multimodal.processing import PromptReplacement, PromptUpdateDetails
 
+# from vllm.multimodal.inputs import MultiModalKwargsItems
+# from vllm.multimodal.parse import ImageEmbeddingItems, ImageProcessorItems, MultiModalDataItems
+# from vllm.multimodal.processing import PromptReplacement, PromptUpdateDetails
 from vllm_omni.model_executor.models.bagel.bagel import (
     OmniBagelDummyInputsBuilder,
     OmniBagelForConditionalGeneration,
@@ -272,38 +273,39 @@ class OmniSenseNovaVisionProcessor(OmniBagelProcessor):
     tokenizer_class = "AutoTokenizer"
 
     def __call__(self, text=None, images=None, **kwargs):
-        is_img2img = kwargs.pop("is_img2img", False)
-        if images is not None and not is_img2img:
-            # Raw (aspect-preserving) pixels: no square pre-resize.  Mirror the
-            # base img2img raw branch; the orchestrating ``_call_hf_processor``
-            # keeps the image/img2img key names distinct.
-            from vllm.transformers_utils.processors.bagel import BagelProcessorKwargs
+        is_img2text = not kwargs.pop("is_img2img", False)
 
-            output_kwargs = self._merge_kwargs(
-                BagelProcessorKwargs,
-                tokenizer_init_kwargs=self.tokenizer.init_kwargs,
-                **kwargs,
-            )
-            image_kwargs = dict(output_kwargs["images_kwargs"])
-            image_kwargs["do_resize"] = False
-            image_kwargs["do_rescale"] = True
-            image_kwargs.setdefault("return_tensors", "pt")
-            pixel_values = self.image_processor(images, **image_kwargs)
+        # if images is not None and is_img2text:
+        #     # Raw (aspect-preserving) pixels: no square pre-resize.  Mirror the
+        #     # base img2img raw branch; the orchestrating ``_call_hf_processor``
+        #     # keeps the image/img2img key names distinct.
+        #     from vllm.transformers_utils.processors.bagel import BagelProcessorKwargs
 
-            text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"]) if text is not None else None
+        #     output_kwargs = self._merge_kwargs(
+        #         BagelProcessorKwargs,
+        #         tokenizer_init_kwargs=self.tokenizer.init_kwargs,
+        #         **kwargs,
+        #     )
+        #     image_kwargs = dict(output_kwargs["images_kwargs"])
+        #     image_kwargs["do_resize"] = False
+        #     image_kwargs["do_rescale"] = True
+        #     image_kwargs.setdefault("return_tensors", "pt")
+        #     pixel_values = self.image_processor(images, **image_kwargs)
 
-            if pixel_values is not None and text_inputs is not None:
-                combined = dict(text_inputs)
-                combined["pixel_values"] = pixel_values["pixel_values"]
-                return BatchFeature(combined)
-            elif pixel_values is not None:
-                return pixel_values
-            elif text_inputs is not None:
-                return BatchFeature(dict(text_inputs))
-            else:
-                return BatchFeature({})
+        #     text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"]) if text is not None else None
 
-        return super().__call__(text, images, is_img2img=is_img2img, **kwargs)
+        #     if pixel_values is not None and text_inputs is not None:
+        #         combined = dict(text_inputs)
+        #         combined["pixel_values"] = pixel_values["pixel_values"]
+        #         return BatchFeature(combined)
+        #     elif pixel_values is not None:
+        #         return pixel_values
+        #     elif text_inputs is not None:
+        #         return BatchFeature(dict(text_inputs))
+        #     else:
+        #         return BatchFeature({})
+
+        return super().__call__(text, images, is_img2img=not is_img2text, **kwargs)
 
 
 class OmniSenseNovaVisionProcessingInfo(OmniBagelProcessingInfo):
@@ -341,119 +343,48 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
         # preserved through to the ``image_shape`` used by the DiT stage.
         return dict(mm_kwargs)
 
-    def _get_prompt_updates(
-        self,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs,
-        out_mm_kwargs: MultiModalKwargsItems,
-    ) -> list[PromptReplacement]:
-        """Build prompt replacements with the SenseNova-Vision VAE transform.
+    # def _get_prompt_updates(
+    #     self,
+    #     mm_items: MultiModalDataItems,
+    #     hf_processor_mm_kwargs: Mapping[str, object],
+    #     out_mm_kwargs: MultiModalKwargsItems,
+    # ) -> list[PromptReplacement]:
+    #     """Placeholder sizing for understanding images, in lockstep with the model.
 
-        Standalone (never calls the BAGEL ``super()`` implementation so the
-        legacy separator/`+1` block layout can never leak back in).  Each
-        modality contributes ONE ``PromptReplacement`` whose ``target`` is a
-        SINGLE placeholder token and whose ``replacement`` is a callable that
-        expands ONE placeholder into the full per-image block (one block per
-        placeholder token in the prompt, in order).  ``_bind_and_group_updates``
-        resolves the single update once per item index, and
-        ``apply_token_matches``/``_iter_placeholders`` match the single-token
-        targets sequentially - so N identical placeholders yield N identical
-        blocks with unambiguous binding.  Each block's full content is
-        ``[<|vision_start|>] fim-patches [<|vision_end|>]
-        [<|vision_start|>] fim-patches [<|vision_end|>]`` for img2img, or a
-        bare run of ``<|image_pad|>`` for understanding, with ``is_embed=None``
-        (every slot embedded) matching the AR model's embedding assembly.
-        """
-        tokenizer = self.info.get_tokenizer()
-        vocab = tokenizer.get_vocab()
+    #     The user's img2text flow feeds the AR model through
+    #     ``_process_img2text_input`` -> ``_resize_to_stride`` (VAE transform) ->
+    #     ``_encode_vit_embeddings`` (ViT transform), whose patch count is
+    #     ``_sensenova_vit_patch_count(_sensenova_vae_resize_dims(h, w))``.  The
+    #     BAGEL base counts with ``bagel_image_size`` applied DIRECTLY to the
+    #     original image, which can diverge for aspect ratios where the VAE
+    #     short-edge floor changes the shape before the ViT step (e.g. extreme
+    #     panoramas) -- an off-by-one here turns into an embedding/placeholder
+    #     count mismatch.  Keep the base img2img replacement (the img2img model
+    #     path resizes with ``bagel_image_size`` directly and stays consistent)
+    #     and only swap the plain ``image`` modality to the same count the AR
+    #     model produces.
+    #     """
+    #     replacements = super()._get_prompt_updates(mm_items, hf_processor_mm_kwargs, out_mm_kwargs)
+    #     tokenizer = self.info.get_tokenizer()
+    #     image_token_id = tokenizer.get_vocab().get("<|image_pad|>")
+    #     if image_token_id is None:
+    #         return replacements
 
-        image_token_id = vocab.get("<|image_pad|>")
-        img2img_token_id = vocab.get("<|fim_middle|>")
-        start_of_image_id = vocab.get("<|vision_start|>")
-        end_of_image_id = vocab.get("<|vision_end|>")
+    #     def understanding_replacement(item_idx: int):
+    #         size = mm_items.get_items("image", ImageProcessorItems).get_image_size(item_idx)
+    #         count = _sensenova_understanding_patch_count(int(size.height), int(size.width)) + 2
+    #         return [image_token_id] * count
 
-        hf_config = self.info.get_hf_config()
-        latent_patch_size = getattr(hf_config, "latent_patch_size", 2)
-        downsample = hf_config.vae_config.get("downsample", 8)
-        latent_downsample = downsample * latent_patch_size
-
-        # Original input HxW for a given item (before any resize).  Falls back
-        # to the ViT max square when the size cannot be read.
-        def _img_size(item_idx: int, modality: str):
-            item = mm_items.get_items(modality, (ImageProcessorItems, ImageEmbeddingItems))
-            if hasattr(item, "get_image_size"):
-                try:
-                    size = item.get_image_size(item_idx)
-                    return int(size.height), int(size.width)
-                except Exception:
-                    pass
-            return SENSENOVA_VISION_VIT_MAX_SIZE, SENSENOVA_VISION_VIT_MAX_SIZE
-
-        def understanding_block(item_idx: int) -> PromptUpdateDetails:
-            # Aspect-aware understanding placeholder run:
-            # ``_sensenova_understanding_patch_count`` applies the same
-            # VAE->ViT two-stage sizing as the model's img2text path
-            # (``_process_img2text_input``).
-            h, w = _img_size(item_idx, "image")
-            return PromptUpdateDetails.from_seq([image_token_id] * _sensenova_understanding_patch_count(h, w))
-
-        def img2img_block(item_idx: int) -> PromptUpdateDetails:
-            h, w = _img_size(item_idx, "img2img")
-
-            # Two-stage official transform: VAE resize first, then the ViT
-            # transform applied to the VAE-RESIZED image (upstream
-            # interleave_inference L325 + update_context_image). Both stages
-            # are aspect-preserving; the ViT patch count follows the aspect
-            # ratio (capped at 4900 = 70x70, never exceeds the old square).
-            new_h, new_w = _sensenova_vae_resize_dims(int(h), int(w))
-            num_vae_patches = (new_h // latent_downsample) * (new_w // latent_downsample)
-            num_vit_patches = _sensenova_vit_patch_count(new_h, new_w)
-            # Upstream-exact layout (Bagel prepare_vae_images /
-            # prepare_vit_images): each block bracketed by <|vision_start|> ...
-            # <|vision_end|>, blocks ADJACENT - no <|fim_middle|> placeholder
-            # run and no separator token ever appear in upstream sequences.
-            #
-            # EVERY slot in the expanded block carries an mm embedding
-            # (``is_embed=None``), mirroring upstream, which assigns
-            # embed_tokens(start/end_of_image) to the marker rows and computed
-            # VAE-latent / ViT-patch embeddings to the patch rows
-            # (``_process_img2img_input`` builds exactly that combined tensor).
-            # This is REQUIRED for vLLM's engine-side placement:
-            # PlaceholderRange positions are matched to embedding rows by the
-            # RUNNING COUNT of is_embed=True slots, so any False slot
-            # interleaved INSIDE the placeholder shifts every subsequent
-            # embedding onto the wrong token (observed GPU-wide corruption in
-            # out_10 with marker rows marked False). all-True keeps the
-            # position->row identity mapping exact.
-            tokens = (
-                [start_of_image_id]
-                + [img2img_token_id] * num_vae_patches
-                + [end_of_image_id]
-                + [start_of_image_id]
-                + [img2img_token_id] * num_vit_patches
-                + [end_of_image_id]
-            )
-            return PromptUpdateDetails.from_seq(tokens)
-
-        out: list[PromptReplacement] = []
-        if image_token_id is not None and "image" in mm_items.get_all_counts():
-            out.append(
-                PromptReplacement(
-                    modality="image",
-                    target=[image_token_id],
-                    replacement=understanding_block,
-                )
-            )
-        if img2img_token_id is not None and start_of_image_id is not None and end_of_image_id is not None:
-            if "img2img" in mm_items.get_all_counts():
-                out.append(
-                    PromptReplacement(
-                        modality="img2img",
-                        target=[img2img_token_id],
-                        replacement=img2img_block,
-                    )
-                )
-        return out
+    #     return [
+    #         PromptReplacement(
+    #             modality="image",
+    #             target=[image_token_id],
+    #             replacement=understanding_replacement,
+    #         )
+    #         if r.modality == "image"
+    #         else r
+    #         for r in replacements
+    #     ]
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -650,177 +581,190 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             n_scheduled = int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
             schedule.append((str(rid), n_computed, n_scheduled))
         self._step_req_schedule = schedule
+
         if inputs_embeds is not None and input_ids is None and input_ids_buffer is not None:
             input_ids = input_ids_buffer
         return input_ids, positions
 
-    def _process_img2text_input(self, multimodal_input):
-        """Base img2text (understanding) embedding, but with upstream sizing.
+    # def _process_img2text_input(self, multimodal_input) -> tuple[torch.Tensor, ...]:
+    #     """Base img2text (understanding) embedding, but with upstream sizing.
 
-        The vLLM-core ``_process_image_input`` feeds the SigLIP a fixed
-        ``image_size x image_size`` square (980x980 -> 70x70 = 4900 patches)
-        and builds the pos-ids grid from ``image_size // patch_size``.  Upstream
-        instead runs the VAE transform then the ViT transform on the ORIGINAL
-        image, so the patch count follows the aspect ratio (no VAE latent
-        encoding for understanding).  This mirrors the img2img path: VAE-resize
-        per image, then :meth:`_encode_vit_embeddings` (which applies the ViT
-        resize internally and the navit-exact SigLIP pos encoding).
+    #     The vLLM-core ``_process_image_input`` feeds the SigLIP a fixed
+    #     ``image_size x image_size`` square (980x980 -> 70x70 = 4900 patches)
+    #     and builds the pos-ids grid from ``image_size // patch_size``.  Upstream
+    #     instead runs the VAE transform then the ViT transform on the ORIGINAL
+    #     image, so the patch count follows the aspect ratio (no VAE latent
+    #     encoding for understanding).  This mirrors the img2img path: VAE-resize
+    #     per image, then :meth:`_encode_vit_embeddings` (which applies the ViT
+    #     resize internally and the navit-exact SigLIP pos encoding).
 
-        The returned per-image embeddings must contain exactly one row per
-        ``<|image_pad|>`` placeholder token (``_sensenova_vit_patch_count``),
-        matching the processor's aspect-aware placeholder sizing.
-        """
-        pixel_values = multimodal_input["pixel_values"]
-        if pixel_values.ndim == 5:
-            b, n, c, h, w = pixel_values.shape
-            pixel_values = pixel_values.reshape(b * n, c, h, w)
+    #     Feeding the RAW pixels into :meth:`._vit_embeddings` (the BAGEL base)
+    #     is what crashed SenseNova-Vision: an untransformed image can keep a
+    #     grid larger than 70x70 (the 2560x1669 e2e asset yields ids up to
+    #     ~8441), and ``position_embedding(ids)`` gathers out of the 4900-row
+    #     table (CUDA device-side assert).  The resize chain caps the fed grid
+    #     to <= 70x70 so ids stay in-distribution.
 
-        num_images = pixel_values.shape[0]
-        if self._ropes_pending:
-            self._ropes_pending.clear()
+    #     The returned per-image embeddings contain the ``<|vision_start|>`` /
+    #     ``<|vision_end|>`` marker rows plus one row per
+    #     ``<|image_pad|>`` placeholder token
+    #     (``_sensenova_vit_patch_count`` + 2), matching the processor's
+    #     aspect-aware placeholder sizing (``_get_prompt_updates``).
+    #     """
+    #     images = self._image_list(multimodal_input["pixel_values"])
+    #     if self._ropes_pending:
+    #         self._ropes_pending.clear()
 
-        vae_resized = [self._resize_to_stride(pixel_values[i : i + 1]) for i in range(num_images)]
-        vit_embeddings = [emb for pv in vae_resized for emb in self._encode_vit_embeddings(pv)]
-        # _encode_vit_embeddings yields (1, N, hidden) per image; the engine's
-        # sanity_check_mm_encoder_outputs requires 2D (N, hidden) embeddings
-        # (the same shape the img2img path returns), so drop the batch dim.
-        return tuple(e.reshape(-1, e.shape[-1]) for e in vit_embeddings)
+    #     vae_resized = [self._resize_to_stride(img[None]) for img in images]
+    #     vit_embeddings = [emb for pv in vae_resized for emb in self._encode_vit_embeddings(pv)]
+    #     # _encode_vit_embeddings yields (1, N, hidden) per image; the engine's
+    #     # sanity_check_mm_encoder_outputs requires 2D (N, hidden) embeddings
+    #     # (the same shape the base img2text path returns), so drop the batch dim.
+    #     vit_embeddings = [e.reshape(-1, e.shape[-1]) for e in vit_embeddings]
 
-    def _process_img2img_input(self, multimodal_input):
-        """Base img2img embedding, but ViT-encoded at upstream sizing.
+    #     marker_ids = torch.tensor(
+    #         [self._start_of_image_id, self._end_of_image_id],
+    #         device=vit_embeddings[0].device,
+    #         dtype=torch.long,
+    #     )
+    #     start, end = self.language_model.model.embed_tokens(marker_ids).split(1)
+    #     return tuple(torch.cat([start.to(e.dtype), e, end.to(e.dtype)]) for e in vit_embeddings)
 
-        The vLLM-core ``_process_img2img_input`` bicubically squashes the ViT
-        feed to a fixed 980x980 square (70x70 = 4900 patches regardless of
-        aspect) and its core ``_process_image_input`` builds the pos-ids grid
-        from ``image_size // patch_size``.  Upstream instead applies
-        ``ImageTransform(980, 224, 14)`` to the VAE-resized image, so patch
-        count follows aspect ratio.  This method replicates the base flow but
-        swaps the ViT encoding for :meth:`_encode_vit_embeddings`.
-        """
-        pixel_values = multimodal_input["pixel_values"]
-        if pixel_values.ndim == 5:
-            b, n, c, h, w = pixel_values.shape
-            pixel_values = pixel_values.reshape(b * n, c, h, w)
+    # def _process_img2img_input(self, multimodal_input):
+    #     """Base img2img embedding, but ViT-encoded at upstream sizing.
 
-        num_images = pixel_values.shape[0]
-        p = self.latent_patch_size
-        timestep = 0
+    #     The vLLM-core ``_process_img2img_input`` bicubically squashes the ViT
+    #     feed to a fixed 980x980 square (70x70 = 4900 patches regardless of
+    #     aspect) and its core ``_process_image_input`` builds the pos-ids grid
+    #     from ``image_size // patch_size``.  Upstream instead applies
+    #     ``ImageTransform(980, 224, 14)`` to the VAE-resized image, so patch
+    #     count follows aspect ratio.  This method replicates the base flow but
+    #     swaps the ViT encoding for :meth:`_encode_vit_embeddings`.
+    #     """
+    #     pixel_values = multimodal_input["pixel_values"]
+    #     if pixel_values.ndim == 5:
+    #         b, n, c, h, w = pixel_values.shape
+    #         pixel_values = pixel_values.reshape(b * n, c, h, w)
 
-        if self._ropes_pending:
-            self._ropes_pending.clear()
+    #     num_images = pixel_values.shape[0]
+    #     p = self.latent_patch_size
+    #     timestep = 0
 
-        # Upstream runs the ViT transform on the VAE-transformed image
-        # (inferencer.update_context_image); do the same here.  _encode_
-        # vit_embeddings handles its own ViT-grid sizing per image -- never
-        # assume a fixed buffer shape equal to the raw input (profile-run
-        # dummies disagree) nor a uniform aspect ratio across the batch.
-        vae_resized = [self._resize_to_stride(pixel_values[i : i + 1]) for i in range(num_images)]
-        vit_embeddings_tuple = tuple(emb for pv in vae_resized for emb in self._encode_vit_embeddings(pv))
+    #     if self._ropes_pending:
+    #         self._ropes_pending.clear()
 
-        marker_ids = torch.tensor(
-            [self._start_of_image_id, self._end_of_image_id],
-            device=pixel_values.device,
-            dtype=torch.long,
-        )
-        marker_embeds = self.language_model.model.embed_tokens(marker_ids)
-        start_embed = marker_embeds[0:1]
-        end_embed = marker_embeds[1:2]
+    #     # Upstream runs the ViT transform on the VAE-transformed image
+    #     # (inferencer.update_context_image); do the same here.  _encode_
+    #     # vit_embeddings handles its own ViT-grid sizing per image -- never
+    #     # assume a fixed buffer shape equal to the raw input (profile-run
+    #     # dummies disagree) nor a uniform aspect ratio across the batch.
+    #     vae_resized = [self._resize_to_stride(pixel_values[i : i + 1]) for i in range(num_images)]
+    #     vit_embeddings_tuple = tuple(emb for pv in vae_resized for emb in self._encode_vit_embeddings(pv))
 
-        results = []
-        for i in range(num_images):
-            single_pv = pixel_values[i : i + 1]
-            single_pv = self._resize_to_stride(single_pv)
-            H, W = single_pv.shape[2:]
+    #     marker_ids = torch.tensor(
+    #         [self._start_of_image_id, self._end_of_image_id],
+    #         device=pixel_values.device,
+    #         dtype=torch.long,
+    #     )
+    #     marker_embeds = self.language_model.model.embed_tokens(marker_ids)
+    #     start_embed = marker_embeds[0:1]
+    #     end_embed = marker_embeds[1:2]
 
-            padded_latent = self.vae.encode(single_pv)
-            h = H // self.latent_downsample
-            w = W // self.latent_downsample
+    #     results = []
+    #     for i in range(num_images):
+    #         single_pv = pixel_values[i : i + 1]
+    #         single_pv = self._resize_to_stride(single_pv)
+    #         H, W = single_pv.shape[2:]
 
-            latent = padded_latent[0][:, : h * p, : w * p]
-            latent = latent.reshape(self.latent_channel, h, p, w, p)
-            latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
+    #         padded_latent = self.vae.encode(single_pv)
+    #         h = H // self.latent_downsample
+    #         w = W // self.latent_downsample
 
-            vae_position_ids = self.get_flattened_position_ids(
-                H,
-                W,
-                self.latent_downsample,
-                max_num_patches_per_side=self.max_latent_size,
-            )
-            pos_embed = self.latent_pos_embed([vae_position_ids])
-            packed_timesteps = torch.tensor([timestep], device=padded_latent.device)
-            with torch.amp.autocast(self.device.type, dtype=torch.bfloat16):
-                timestep_embeds = self.time_embedder(packed_timesteps.to(padded_latent))
-            vae_embeds = self.vae2llm(latent) + timestep_embeds + pos_embed
+    #         latent = padded_latent[0][:, : h * p, : w * p]
+    #         latent = latent.reshape(self.latent_channel, h, p, w, p)
+    #         latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
 
-            vit_emb_full = vit_embeddings_tuple[i] if i < len(vit_embeddings_tuple) else vit_embeddings_tuple[0]
-            # _encode_vit_embeddings yields (1, N, hidden); drop the batch dim.
-            vit_emb = vit_emb_full.reshape(-1, vit_emb_full.shape[-1])
+    #         vae_position_ids = self.get_flattened_position_ids(
+    #             H,
+    #             W,
+    #             self.latent_downsample,
+    #             max_num_patches_per_side=self.max_latent_size,
+    #         )
+    #         pos_embed = self.latent_pos_embed([vae_position_ids])
+    #         packed_timesteps = torch.tensor([timestep], device=padded_latent.device)
+    #         with torch.amp.autocast(self.device.type, dtype=torch.bfloat16):
+    #             timestep_embeds = self.time_embedder(packed_timesteps.to(padded_latent))
+    #         vae_embeds = self.vae2llm(latent) + timestep_embeds + pos_embed
 
-            se = start_embed.to(vae_embeds.dtype)
-            ee = end_embed.to(vae_embeds.dtype)
-            combined = torch.cat([se, vae_embeds, ee, se, vit_emb, ee], dim=0)
-            results.append(combined)
+    #         vit_emb_full = vit_embeddings_tuple[i] if i < len(vit_embeddings_tuple) else vit_embeddings_tuple[0]
+    #         # _encode_vit_embeddings yields (1, N, hidden); drop the batch dim.
+    #         vit_emb = vit_emb_full.reshape(-1, vit_emb_full.shape[-1])
 
-            num_vae = h * w + 2  # +2 for start/end markers
-            num_vit = vit_emb.shape[0] + 2
-            info = (num_vae, num_vit, int(H), int(W))
-            self._pending_img2img_info.append(info)
-            self._last_img2img_info = info
+    #         se = start_embed.to(vae_embeds.dtype)
+    #         ee = end_embed.to(vae_embeds.dtype)
+    #         combined = torch.cat([se, vae_embeds, ee, se, vit_emb, ee], dim=0)
+    #         results.append(combined)
 
-        return tuple(results)
+    #         num_vae = h * w + 2  # +2 for start/end markers
+    #         num_vit = vit_emb.shape[0] + 2
+    #         info = (num_vae, num_vit, int(H), int(W))
+    #         self._pending_img2img_info.append(info)
+    #         self._last_img2img_info = info
 
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors=None,
-        inputs_embeds: torch.Tensor | None = None,
-        **kwargs: object,
-    ) -> torch.Tensor:
-        """SenseNova-Vision img2img bookkeeping (upstream-exact block layout).
+    #     return tuple(results)
 
-        Mirrors ``OmniBagelForConditionalGeneration.forward`` but with the
-        SEPARATOR-FREE block span (``num_vae + num_vit`` tokens, see
-        ``_get_prompt_updates`` above): the BAGEL base assumes a legacy
-        ``<|fim_middle|>`` separator between the VAE and ViT sections that
-        upstream sequences never contain.  Text-only / img2text requests
-        bypass this path entirely and fall through to the base forward.
+    # def forward(
+    #     self,
+    #     input_ids: torch.Tensor | None,
+    #     positions: torch.Tensor,
+    #     intermediate_tensors=None,
+    #     inputs_embeds: torch.Tensor | None = None,
+    #     **kwargs: object,
+    # ) -> torch.Tensor:
+    #     """SenseNova-Vision img2img bookkeeping (upstream-exact block layout).
 
-        Gating is per-request, from the step schedule captured by
-        ``prepare_runner_inputs`` (``_step_req_schedule``): the batch-wide
-        ``inputs_embeds.shape[0]`` / ``positions.shape[0]`` length is replaced
-        by each request's ``(num_computed, num_scheduled)`` so a padded
-        CUDA-graph batch or a sibling request can never change how a
-        request's chunk is classified.  A request enters the img2img MoT path
-        when this step contains an active layout for it (``_img2img_layouts``)
-        or when pending geometry is queued.  See ``_adjust_positions_for_img2img``
-        for the per-request collapse / partial-collapse / rope-only logic.
-        """
-        # _adjust_positions_for_img2img consumes _step_req_schedule; do not
-        # clear it here.
-        schedule = self._step_req_schedule or []
+    #     Mirrors ``OmniBagelForConditionalGeneration.forward`` but with the
+    #     SEPARATOR-FREE block span (``num_vae + num_vit`` tokens, see
+    #     ``_get_prompt_updates`` above): the BAGEL base assumes a legacy
+    #     ``<|fim_middle|>`` separator between the VAE and ViT sections that
+    #     upstream sequences never contain.  Text-only / img2text requests
+    #     bypass this path entirely and fall through to the base forward.
 
-        use_mot = False
-        any_img2img = bool(self._pending_img2img_info) or bool(self._img2img_layouts)
-        if not any_img2img:
-            for rid, _n_computed, _n_scheduled in schedule:
-                if rid in self._img2img_layouts:
-                    any_img2img = True
-                    break
+    #     Gating is per-request, from the step schedule captured by
+    #     ``prepare_runner_inputs`` (``_step_req_schedule``): the batch-wide
+    #     ``inputs_embeds.shape[0]`` / ``positions.shape[0]`` length is replaced
+    #     by each request's ``(num_computed, num_scheduled)`` so a padded
+    #     CUDA-graph batch or a sibling request can never change how a
+    #     request's chunk is classified.  A request enters the img2img MoT path
+    #     when this step contains an active layout for it (``_img2img_layouts``)
+    #     or when pending geometry is queued.  See ``_adjust_positions_for_img2img``
+    #     for the per-request collapse / partial-collapse / rope-only logic.
+    #     """
+    #     # _adjust_positions_for_img2img consumes _step_req_schedule; do not
+    #     # clear it here.
+    #     schedule = self._step_req_schedule or []
 
-        if any_img2img:
-            self._log_prompt_token_probe(input_ids)
-            positions = self._adjust_positions_for_img2img(positions, input_ids)
-            use_mot = True
+    #     use_mot = False
+    #     any_img2img = bool(self._pending_img2img_info) or bool(self._img2img_layouts)
+    #     if not any_img2img:
+    #         for rid, _n_computed, _n_scheduled in schedule:
+    #             if rid in self._img2img_layouts:
+    #                 any_img2img = True
+    #                 break
 
-        if use_mot:
-            return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+    #     if any_img2img:
+    #         self._log_prompt_token_probe(input_ids)
+    #         positions = self._adjust_positions_for_img2img(positions, input_ids)
+    #         use_mot = True
 
-        # Text-only / img2text path: bypass the BAGEL base's img2img
-        # bookkeeping (its separator-based span math does not apply here).
-        return super(OmniBagelForConditionalGeneration, self).forward(
-            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
-        )
+    #     if use_mot:
+    #         return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+
+    #     # Text-only / img2text path: bypass the BAGEL base's img2img
+    #     # bookkeeping (its separator-based span math does not apply here).
+    #     return super(OmniBagelForConditionalGeneration, self).forward(
+    #         input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+    #     )
 
     def _adjust_positions_for_img2img(
         self,

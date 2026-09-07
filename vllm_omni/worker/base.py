@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Base worker class for vLLM-Omni with device-level GPU memory profiling."""
 
 from __future__ import annotations
@@ -131,7 +134,11 @@ class OmniGPUWorkerBase(GPUWorker):
         # true here). Mirror upstream so the omni override keeps it populated.
         self.total_consumed = profile_result.total_consumed
 
+        # HACK: temp fix for NVML memory profiling bug
         process_memory = None
+        from vllm_omni.entrypoints.utils import detect_pid_host
+        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory, is_process_scoped_memory_available
+
         if is_process_scoped_memory_available() and detect_pid_host():
             process_memory = get_process_gpu_memory(self.local_rank)
             # A per-process NVML reading is only trustworthy when it actually
