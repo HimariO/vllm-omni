@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for SenseNova-Vision multi-image support in the AR stage.
 
 Covers four things:
@@ -23,18 +23,18 @@ weights are loaded.
 Worst-case token budget (stage 0, ``deploy/sensenova_vision.yaml`` has
 ``max_num_batched_tokens: 32768``)::
 
-    per img2img block (recon3d-size 512x512 input):
+    per img2img block (recon3d-size 512x512 input, SenseNova VAE->ViT):
         VAE section  = (512/16)^2 + 2            =   1026 tokens
-        ViT section  = (980/14)^2 + 2            =   4902 tokens  (fixed)
-        block total  =                             5928 tokens
-    10-image request (limit cap): 10 x 5928       =  59280 prompt tokens
+        separator    =                              1 token
+        ViT section  = aspect grid + 2             ~=  1371 tokens
+        block total  =                             2398 tokens
+    10-image request (limit cap): 10 x 2398       =  23980 prompt tokens
 
-(Upstream-exact layout: each section bracketed by SOI/EOI, sections ADJACENT
--- no separator token appears in the sequence.)
+(BAGEL separator layout is kept so extract_embeds_range() yields two mm
+ranges for M-RoPE; sizes come from ``_sensenova_*_resize_dims``.)
 
-A single block (5928) fits comfortably inside one 32768-token prefill step;
-a full 10-image request exceeds one step and therefore progresses via vLLM's
-chunked prefill.  The limit stays a finite 10 (never ``None``) so mm memory
+A single block and a full 10-image request both fit inside one 32768-token
+prefill step.  The limit stays a finite 10 (never ``None``) so mm memory
 profiling remains bounded.
 """
 
@@ -80,6 +80,7 @@ def checkpoint() -> str:
     snap = _cached_checkpoint()
     if snap is None:
         pytest.skip("SenseNova-Vision-7B-MoT not cached and SENSENOVA_VISION_MODEL_PATH is unset")
+    assert snap is not None
     return snap
 
 
@@ -144,6 +145,8 @@ def _expected_img2img_block_len(h: int, w: int) -> tuple[int, int, int]:
     Mirrors the BAGEL-BASE resize arithmetic; only used by the 2b test,
     which exercises the base ``OmniBagelMultiModalProcessor`` expansion.
     """
+    from vllm_omni.diffusion.models.bagel.pipeline_bagel import bagel_image_size
+
     stride = LATENT_DOWNSAMPLE
     max_img_size = MAX_LATENT_SIZE * stride
     scale = min(max_img_size / max(h, w), 1.0)
@@ -153,7 +156,9 @@ def _expected_img2img_block_len(h: int, w: int) -> tuple[int, int, int]:
     new_w = min(max(stride, int(round(w * scale / stride)) * stride), max_img_size)
     num_vae_patches = (new_h // stride) * (new_w // stride)
     num_vae_total = num_vae_patches + 2
-    return num_vae_total, VIT_PATCH_TOTAL, num_vae_total + 1 + VIT_PATCH_TOTAL
+    vit_w, vit_h = bagel_image_size(w, h, 980, 224, 14)
+    num_vit_total = (vit_h // 14) * (vit_w // 14) + 2
+    return num_vae_total, num_vit_total, num_vae_total + 1 + num_vit_total
 
 
 # ---------------------------------------------------------------------------
@@ -172,8 +177,9 @@ def test_sensenova_mm_limits_raise_to_ten(info_ctx):
 
 def test_shared_bagel_base_limits_unchanged(info_ctx):
     """The override must live in the SenseNova subclass only."""
+    # BAGEL base leaves understanding unbounded (None) and caps img2img at 1.
     assert bagel_module.OmniBagelProcessingInfo(info_ctx).get_supported_mm_limits() == {
-        "image": 1,
+        "image": None,
         "img2img": 1,
     }
 
@@ -194,6 +200,8 @@ def test_model_class_registered_with_sensenova_info():
 
 
 def test_n_image_placeholders_bind_n_items(tokenizer, hf_config, info_ctx):
+    from vllm_omni.diffusion.models.bagel.pipeline_bagel import bagel_image_size
+
     n = 3
     pad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     images = [Image.new("RGB", (64, 64)) for _ in range(n)]
@@ -217,7 +225,8 @@ def test_n_image_placeholders_bind_n_items(tokenizer, hf_config, info_ctx):
     img_ph = placeholders["image"]
     assert len(img_ph) == n, "N <|image_pad|> placeholders must bind N image items"
     assert [ph.item_idx for ph in img_ph] == list(range(n))
-    expected_len = VIT_MAX_NUM_PATCH_PER_SIDE**2
+    vit_w, vit_h = bagel_image_size(64, 64, 980, 224, 14)
+    expected_len = (vit_h // 14) * (vit_w // 14) + 2
     starts = []
     for ph in img_ph:
         assert ph.tokens == [pad_id] * expected_len
@@ -234,7 +243,8 @@ def test_n_image_placeholders_bind_n_items(tokenizer, hf_config, info_ctx):
 def test_n_fim_middle_placeholders_produce_n_blocks(tokenizer, hf_config, info_ctx):
     n = 2
     fim_id = tokenizer.convert_tokens_to_ids("<|fim_middle|>")
-    sizes = [(512, 512), (256, 384)]  # (H, W)
+    # (H, W)
+    sizes: list[tuple[int, int]] = [(512, 512), (256, 384)]  # (H, W)
     images = [Image.new("RGB", (w, h)) for h, w in sizes]
     mm_items = MultiModalDataItems({"img2img": bagel_module.Img2ImgProcessorItems(images)})
 
@@ -264,15 +274,15 @@ def test_n_fim_middle_placeholders_produce_n_blocks(tokenizer, hf_config, info_c
 
 
 def test_sensenova_img2img_expansion_is_upstream_exact(tokenizer, hf_config, info_ctx):
-    """The SenseNova override must emit SOI/EOI-bracketed ADJACENT sections.
+    """SenseNova placeholder counts must lockstep with ``_sensenova_*_resize_dims``.
 
-    Regression guard for the upstream-exact relayout AND for bugs that only
-    manifest inside the subclass closure (e.g. a NameError there): unlike
-    2a/2b above, this drives the *subclass* processor expansion directly.
+    Layout keeps BAGEL's separator so extract_embeds_range() yields two mm
+    ranges for M-RoPE; sizes use the official VAE then ViT chain.
     """
     from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
         OmniSenseNovaVisionMultiModalProcessor,
         OmniSenseNovaVisionProcessingInfo,
+        _sensenova_img2img_token_counts,
         _sensenova_vae_resize_dims,
         _sensenova_vit_resize_dims,
     )
@@ -294,34 +304,29 @@ def test_sensenova_img2img_expansion_is_upstream_exact(tokenizer, hf_config, inf
     _new_ids, placeholders = proc._apply_prompt_updates(prompt_ids, mm_prompt_updates)
 
     (ph,) = placeholders["img2img"]
-    vocab = tokenizer.get_vocab()
-    soi_id, eoi_id = vocab["<|vision_start|>"], vocab["<|vision_end|>"]
-    fim_id = vocab["<|fim_middle|>"]
+    fim_id = tokenizer.get_vocab()["<|fim_middle|>"]
 
     # Official two-stage transform: VAE resize, then ViT resize OF THE VAE-
     # RESIZED image.  The ViT count follows aspect ratio (upstream
     # ImageTransform(980, 224, 14)), NOT the fixed 70x70 square.
     new_h, new_w = _sensenova_vae_resize_dims(h, w)
     vit_h, vit_w = _sensenova_vit_resize_dims(new_h, new_w)
-    num_vae_patches = (new_h // LATENT_DOWNSAMPLE) * (new_w // LATENT_DOWNSAMPLE)
+    num_vae_total, num_vit_total, vae_h, vae_w = _sensenova_img2img_token_counts(h, w)
+    assert (vae_h, vae_w) == (new_h, new_w)
     num_vit_patches = (vit_h // 14) * (vit_w // 14)
     assert num_vit_patches <= VIT_MAX_NUM_PATCH_PER_SIDE**2, "aspect grid must stay within the 70x70 cap"
-    num_vae, num_vit = num_vae_patches + 2, num_vit_patches + 2
+    assert num_vit_total == num_vit_patches + 2
 
-    assert ph.length == num_vae + num_vit, "VAE/ViT sections must be ADJACENT (no separator token)"
-    tokens = ph.tokens
-    assert tokens[0] == soi_id and tokens[num_vae - 1] == eoi_id, "VAE section must be SOI-bracketed"
-    assert tokens[num_vae] == soi_id and tokens[-1] == eoi_id, "ViT section must be SOI-bracketed"
-    assert all(t == fim_id for t in tokens[1 : num_vae - 1]), "VAE interior must be fim placeholders"
-    assert all(t == fim_id for t in tokens[num_vae + 1 : -1]), "ViT interior must be fim placeholders"
+    # BAGEL separator between VAE and ViT sections for M-RoPE ranges.
+    total = num_vae_total + 1 + num_vit_total
+    assert ph.length == total
+    assert all(t == fim_id for t in ph.tokens)
 
-    # EVERY slot carries an embedding: _process_img2img_input builds the full
-    # combined tensor [se, vae..., ee, se, vit..., ee], and vLLM's engine maps
-    # placeholder positions to embedding rows by the RUNNING COUNT of
-    # is_embed=True slots -- a False slot interleaved INSIDE the block would
-    # shift every later embedding onto the wrong token (out_10 corruption).
-    assert ph.is_embed is None or bool(ph.is_embed.all()), "all expanded slots must be marked embedded"
-    assert tokenizer.convert_tokens_to_ids("<|fim_middle|>") == fim_id
+    mask = ph.is_embed
+    assert mask is not None and mask.shape[0] == total
+    assert mask[:num_vae_total].all(), "VAE section must be embedded"
+    assert not mask[num_vae_total], "separator must not be embedded"
+    assert mask[num_vae_total + 1 :].all(), "ViT section must be embedded"
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +382,7 @@ def _two_block_ids(soi_id: int, fim_id: int, eoi_id: int) -> tuple[list[int], in
     return ids, num_vae, num_vit
 
 
+@pytest.mark.skip(reason="outdated: SenseNova now reuses BAGEL M-RoPE layout; custom position rewrite removed")
 def test_adjust_positions_handles_two_img2img_blocks_in_one_request(tokenizer):
     vocab = tokenizer.get_vocab()
     soi_id = vocab["<|vision_start|>"]
@@ -439,6 +445,7 @@ def test_adjust_positions_handles_two_img2img_blocks_in_one_request(tokenizer):
     assert stub._img2img_layouts == {}, "layout must be pruned at first decode"
 
 
+@pytest.mark.skip(reason="outdated: SenseNova now reuses BAGEL M-RoPE layout; custom position rewrite removed")
 def test_adjust_positions_single_block_unchanged(tokenizer):
     """Guard: the upstream-exact relayout must not alter single-block results."""
     vocab = tokenizer.get_vocab()
@@ -465,6 +472,7 @@ def test_adjust_positions_single_block_unchanged(tokenizer):
     # full metadata (prefill_position_count == num_computed == prompt_len).
     assert stub._ropes_pending == [{"ropes": [m + 4]}]
     mask = stub._vae_token_mask
+    assert mask is not None
     assert all(mask[i] for i in range(m + 1, m + num_vae - 1))
 
     stub._step_req_schedule = [("r1", len(ids), 1)]
@@ -487,6 +495,7 @@ def _split_chunks(ids: list[int], cut: int) -> tuple[list[int], list[int]]:
     return ids[:cut], ids[cut:]
 
 
+@pytest.mark.skip(reason="outdated: SenseNova now reuses BAGEL M-RoPE layout; custom position rewrite removed")
 def test_adjust_positions_split_block_spans_two_chunks(tokenizer):
     """Bug C: a block split by chunked prefill must be collapsed correctly.
 
@@ -546,6 +555,7 @@ def test_adjust_positions_split_block_spans_two_chunks(tokenizer):
     # machine, not from FIFO accounting, so nothing else needs to remain.
 
 
+@pytest.mark.skip(reason="outdated: SenseNova now reuses BAGEL M-RoPE layout; custom position rewrite removed")
 def test_adjust_positions_chunked_multi_block_continuation(tokenizer):
     """A two-block request split across three chunks must match single-chunk.
 
@@ -607,6 +617,7 @@ def test_adjust_positions_chunked_multi_block_continuation(tokenizer):
     assert stub._img2img_layouts == {}
 
 
+@pytest.mark.skip(reason="outdated: SenseNova now reuses BAGEL M-RoPE layout; custom position rewrite removed")
 def test_adjust_positions_mixed_img2img_text_batch(tokenizer):
     """Batch of (img2img, text-only, img2img) must map ropes 1:1 in order."""
     vocab = tokenizer.get_vocab()
@@ -720,30 +731,31 @@ def test_embed_multimodal_returns_n_embeddings_per_modality():
 def test_img2img_batch_flattens_leading_batch_dim():
     """A (B, N, C, H, W) img2img tensor must yield one info tuple per image."""
     inst = object.__new__(bagel_module.OmniBagelForConditionalGeneration)
-    infos = []
+    infos: list[tuple[int, int, int, int]] = []
     inst.latent_downsample = LATENT_DOWNSAMPLE
     inst.max_latent_size = MAX_LATENT_SIZE
     inst.latent_channel = 16
     inst.latent_patch_size = 2
-    inst.config = SimpleNamespace(vit_config=SimpleNamespace(image_size=64))
+    inst.config = SimpleNamespace(vit_config=SimpleNamespace(image_size=64, patch_size=14))
     inst.device = torch.device("cpu")
 
     captured = {}
 
-    def fake_process_image_input(mm_input):
-        captured["pv"] = mm_input["pixel_values"]
-        return tuple(torch.zeros(1, 4) for _ in range(captured["pv"].shape[0]))
+    def fake_vit_embeddings(images):
+        captured["n"] = len(images)
+        return [torch.zeros(1, 4) for _ in images]
 
     class _FakeVAE:
         def encode(self, x):
             # Bare latent tensor, 16 channels, /8 spatial (DiagonalGaussian output).
             return torch.zeros(x.shape[0], 16, x.shape[2] // 8, x.shape[3] // 8)
 
-    inst._process_image_input = fake_process_image_input
+    inst._vit_embeddings = fake_vit_embeddings
     inst.vae = _FakeVAE()
     inst._resize_to_stride = lambda pv: pv
+    inst.get_flattened_position_ids = lambda *a, **k: torch.zeros(1, dtype=torch.long)
     inst.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: torch.zeros(len(ids), 4)))
-    inst.vae2llm = lambda z: z[:, :4]
+    inst.vae2llm = lambda z: torch.zeros(z.shape[0], 4)
     inst.latent_pos_embed = lambda pos: torch.zeros(1, 4)
     inst.time_embedder = lambda t: torch.zeros(1, 4)
     inst._start_of_image_id = 151652
@@ -755,7 +767,7 @@ def test_img2img_batch_flattens_leading_batch_dim():
     batched = torch.zeros(1, 2, 3, 32, 32)  # (batch=1, num_images=2, ...)
     inst._process_img2img_input({"pixel_values": batched})
 
-    assert captured["pv"].shape[0] == 2, "leading batch dim must be flattened"
+    assert captured["n"] == 2, "leading batch dim must be flattened"
     assert len(infos) == 2, "one (num_vae, num_vit, H, W) info tuple per image"
 
 
@@ -802,6 +814,7 @@ def _make_siglip_embeddings_stub(grid: int, dim: int, patch_size: int):
     return emb
 
 
+@pytest.mark.skip(reason="outdated: custom SigLIP pos-encoding patch removed; uses bagel _vit_embeddings")
 def test_fix_siglip_pos_encoding_aspect_grid_exact_rows():
     """_fix_siglip_pos_encoding must bind the navit-EXACT lookup: for any
     aspect grid <= 70x70, position rows come straight from the trained table
@@ -829,6 +842,7 @@ def test_fix_siglip_pos_encoding_aspect_grid_exact_rows():
     assert torch.equal(out[0], table[ids]), "pos rows must be exact trained-table lookups"
 
 
+@pytest.mark.skip(reason="outdated: custom SigLIP pos-encoding patch removed; uses bagel _vit_embeddings")
 def test_fix_siglip_pos_encoding_aspect_rect_rows():
     """True rectangular grid (gcg_seg profile: taller than wide): rows follow
     h-major order into the square trained table."""
@@ -847,6 +861,7 @@ def test_fix_siglip_pos_encoding_aspect_rect_rows():
     assert torch.equal(out[0], table[ids])
 
 
+@pytest.mark.skip(reason="outdated: custom SigLIP pos-encoding patch removed; uses bagel _vit_embeddings")
 def test_fix_siglip_pos_encoding_rejects_oversized_grid():
     """No rows exist beyond 70x70; an oversized grid must fail loudly
     instead of silently indexing garbage."""
@@ -860,6 +875,7 @@ def test_fix_siglip_pos_encoding_rejects_oversized_grid():
         emb.interpolate_pos_encoding(torch.randn(1, 71 * 71, 1152), 71 * 14, 71 * 14)
 
 
+@pytest.mark.skip(reason="outdated: custom SigLIP pos-encoding patch removed; uses bagel _vit_embeddings")
 def test_fix_siglip_pos_encoding_square_feed_uses_table_directly():
     """The early-return branch must remain: square + matching grid returns
     the raw position embedding rows unchanged."""
@@ -874,6 +890,7 @@ def test_fix_siglip_pos_encoding_square_feed_uses_table_directly():
     assert torch.equal(out, emb.position_embedding.weight.unsqueeze(0))
 
 
+@pytest.mark.skip(reason="outdated: custom SigLIP pos-encoding patch removed; uses bagel _vit_embeddings")
 def test_fix_siglip_pos_encoding_idempotent():
     from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
         _fix_siglip_pos_encoding,
@@ -886,6 +903,7 @@ def test_fix_siglip_pos_encoding_idempotent():
     assert emb.interpolate_pos_encoding is bound_method, "must not rebind on a second call"
 
 
+@pytest.mark.skip(reason="outdated: custom SigLIP pos-encoding patch removed; uses bagel _vit_embeddings")
 def test_stock_vllm_interpolation_crashes_on_aspect_grid():
     """Documentation-by-test: the STOCK vllm SiglipVisionEmbeddings raises
     exactly the profile-run error on any non-square feed.  This pins WHY we
@@ -926,33 +944,18 @@ def test_stock_vllm_interpolation_crashes_on_aspect_grid():
 
 
 def test_worst_case_token_budget_arithmetic():
-    """Documented budget for the limit=10 cap (see module docstring).
+    """Budget for the limit=10 cap with SenseNova VAE/ViT lockstep sizing.
 
-    A single recon3d-size block (5928 tokens, upstream-exact layout with
-    ADJACENT SOI/EOI-bracketed sections and no separator) must fit inside
-    one stage-0 prefill step (``max_num_batched_tokens: 32768``); a full
-    10-image request (59280 tokens) exceeds one step and progresses via
-    chunked prefill.
+    A 512x512 recon3d-size block uses VAE+sep+ViT placeholders and must fit
+    inside one stage-0 prefill step (``max_num_batched_tokens: 32768``).
+    With aspect-aware ViT the 10-image budget also fits in one step.
     """
     from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
-        _sensenova_vae_resize_dims,
+        _sensenova_img2img_token_counts,
     )
 
-    new_h, new_w = _sensenova_vae_resize_dims(512, 512)
-    assert (new_h, new_w) == (512, 512)
-    num_vae_patches = (new_h // LATENT_DOWNSAMPLE) * (new_w // LATENT_DOWNSAMPLE)
-    vae_total = num_vae_patches + 2  # + SOI/EOI markers
-    vit_total = VIT_PATCH_TOTAL  # 4902, markers included
-    block_total = vae_total + vit_total  # sections ADJACENT, no separator
-    assert (vae_total, vit_total) == (1026, 4902)
-    assert block_total == 5928
-
-    stage0_step_budget = 32768  # deploy/sensenova_vision.yaml stages[0]
-    assert block_total < stage0_step_budget, "one img2img block must fit in a single prefill step"
-
-    limit = 10
-    worst_case_prompt_tokens = limit * block_total
-    assert worst_case_prompt_tokens == 59280
-    # The cap must stay finite so mm profiling allocates a bounded dummy
-    # batch (never unbounded/None).
-    assert isinstance(limit, int) and limit > 0
+    num_vae, num_vit, _, _ = _sensenova_img2img_token_counts(512, 512)
+    per_block = num_vae + 1 + num_vit
+    assert per_block == 2398
+    assert per_block <= 32768
+    assert 10 * per_block <= 32768
