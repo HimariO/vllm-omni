@@ -385,7 +385,13 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             num_vae = h * w + 2
             num_vit = vit_emb.shape[0] + 2
             info = (num_vae, num_vit, int(h_px), int(w_px))
-            self._pending_img2img_info.append(info)
+            # Register in the pending list AND the cross-request size cache.  A
+            # later request whose image the encoder/prefix cache serves (no
+            # embed run) resolves its (H, W) via ``_match_img2img_info`` ->
+            # ``_img2img_info_by_size``; without the size-cache entry the DiT
+            # stage falls back to a square 1024x1024 output instead of the
+            # aspect-preserving VAE dims.
+            self._register_img2img_info(info)
             self._last_img2img_info = info
 
         return tuple(results)

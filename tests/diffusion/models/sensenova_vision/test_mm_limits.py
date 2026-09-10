@@ -762,6 +762,8 @@ def test_img2img_batch_flattens_leading_batch_dim():
     inst._end_of_image_id = 151653
     inst._ropes_pending = []
     inst._pending_img2img_info = infos
+    inst._img2img_info_by_size = {}
+    inst._img2img_by_req = {}
     inst._last_img2img_info = None
 
     batched = torch.zeros(1, 2, 3, 32, 32)  # (batch=1, num_images=2, ...)
@@ -769,6 +771,68 @@ def test_img2img_batch_flattens_leading_batch_dim():
 
     assert captured["n"] == 2, "leading batch dim must be flattened"
     assert len(infos) == 2, "one (num_vae, num_vit, H, W) info tuple per image"
+
+
+def test_sensenova_img2img_seeds_size_cache_for_cache_served_request():
+    """A SenseNova img2img embed must seed the cross-request size cache.
+
+    Regression for the aspect-ratio bug: ``seg`` (2.jpg) then ``normal``
+    (2.jpg) in one process lost the second request's ``image_shape``, so the
+    DiT fell back to a square 1024x1024 output.  ``_process_img2img_input``
+    appends to ``_pending_img2img_info`` but the size lookup for a later
+    request whose image the encoder/prefix cache serves (no embed run) is
+    ``_img2img_info_by_size`` — that cache is only seeded by
+    ``_register_img2img_info``.
+    """
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        OmniSenseNovaVisionForConditionalGeneration,
+    )
+
+    inst = object.__new__(OmniSenseNovaVisionForConditionalGeneration)
+    inst.latent_downsample = LATENT_DOWNSAMPLE
+    inst.max_latent_size = MAX_LATENT_SIZE
+    inst.latent_channel = 16
+    inst.latent_patch_size = 2
+    inst.config = SimpleNamespace(vit_config=SimpleNamespace(image_size=64, patch_size=14))
+    inst.device = torch.device("cpu")
+
+    captured = {}
+
+    def fake_vit_embeddings(images):
+        captured["n"] = len(images)
+        return [torch.zeros(1, 4) for _ in images]
+
+    class _FakeVAE:
+        def encode(self, x):
+            return torch.zeros(x.shape[0], 16, x.shape[2] // 8, x.shape[3] // 8)
+
+    inst._vit_embeddings = fake_vit_embeddings
+    inst._resize_to_stride = lambda pv: pv
+    inst._resize_for_vit = lambda pv: pv
+    inst.vae = _FakeVAE()
+    inst.get_flattened_position_ids = lambda *a, **k: torch.zeros(1, dtype=torch.long)
+    inst.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: torch.zeros(len(ids), 4)))
+    inst.vae2llm = lambda z: torch.zeros(z.shape[0], 4)
+    inst.latent_pos_embed = lambda pos: torch.zeros(1, 4)
+    inst.time_embedder = lambda t: torch.zeros(1, 4)
+    inst._start_of_image_id = 151652
+    inst._end_of_image_id = 151653
+    inst._ropes_pending = []
+    inst._pending_img2img_info = []
+    inst._img2img_info_by_size = {}
+    inst._img2img_by_req = {}
+    inst._last_img2img_info = None
+
+    img = torch.zeros(1, 1, 3, 32, 32)  # (batch, num_images, C, H, W)
+    inst._process_img2img_input({"pixel_values": img})
+
+    # Pending metadata consumed by this step's routing...
+    assert len(inst._pending_img2img_info) == 1
+    # ...and the size cache must ALSO be seeded so a cache-served follow-up
+    # request (no embed run) can resolve its (H, W).
+    key = tuple(inst._pending_img2img_info[0][:2])
+    assert key in inst._img2img_info_by_size, "size cache must be seeded by the embed run"
+    assert inst._img2img_info_by_size[key][2:] == (32, 32), inst._img2img_info_by_size[key]
 
 
 # ---------------------------------------------------------------------------
