@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Prompt construction + AR->DiT text bridging helpers for the SenseNova-Vision think topology.
 
 The ``sensenova_vision_think`` pipeline splits raw text into a system (think)
@@ -63,6 +63,21 @@ _IM_END = "<|im_end|>"
 # image-generation one.
 _THINK_UNDERSTANDING_MODE = "think_understanding"
 
+# Modes whose AR text is a real decoded caption/thought that should be lifted
+# into the DiT output as ``text_output``.  These correspond to the
+# ``_BASE_PARAMS`` modes that set ``think: True`` (caption_generate /
+# think_generate / think_edit / think_understanding).  All other modes decode
+# no meaningful AR text (or, when AR max_tokens is clamped to 1, a junk
+# artifact), so their stage-0 text must NOT be surfaced.
+THINK_TEXT_MODES = frozenset(
+    {
+        "caption_generate",
+        "think_generate",
+        "think_edit",
+        "think_understanding",
+    }
+)
+
 
 def build_think_prompt(content: str, mode: str = "generate") -> str:
     """Wrap ``content`` with the think system prompt for image-output modes.
@@ -81,13 +96,8 @@ def build_think_prompt(content: str, mode: str = "generate") -> str:
 
     See the module docstring for the single-bos/eos caveat vs upstream.
     """
-    system_prompt = (
-        VLM_THINK_SYSTEM_PROMPT if mode == _THINK_UNDERSTANDING_MODE else GEN_THINK_SYSTEM_PROMPT
-    )
-    return (
-        f"{_IM_START}system\n{system_prompt}{_IM_END}\n"
-        f"{_IM_START}user\n{content}"
-    )
+    system_prompt = VLM_THINK_SYSTEM_PROMPT if mode == _THINK_UNDERSTANDING_MODE else GEN_THINK_SYSTEM_PROMPT
+    return f"{_IM_START}system\n{system_prompt}{_IM_END}\n{_IM_START}user\n{content}"
 
 
 def bridge_think_text_to_image(
@@ -110,11 +120,13 @@ def bridge_think_text_to_image(
     2. Return ``prompt`` unchanged so the DiT still conditions on the original
        user prompt (the stage-0 KV cache carries the thinking).
 
-    If no stage-0 text can be extracted, or ``sampling_params`` has no
-    ``extra_args``, this is a no-op that still passes ``prompt`` through.
+    If no stage-0 text can be extracted, ``sampling_params`` has no
+    ``extra_args``, or the request's mode is not a thinking mode (no AR text
+    should be surfaced, e.g. dense_perception / recon3d), this is a no-op that
+    still passes ``prompt`` through.
     """
     text = _extract_stage0_text(source_outputs)
-    if text and sampling_params is not None:
+    if text and sampling_params is not None and _mode_surfaces_text(prompt):
         extra = getattr(sampling_params, "extra_args", None)
         if extra is None:
             extra = {}
@@ -122,11 +134,23 @@ def bridge_think_text_to_image(
         # Do not clobber an explicitly supplied value.
         extra.setdefault("text_output", text)
         logger.debug(
-            "bridge_think_text_to_image: staged stage-0 text (len=%d) into "
-            "diffusion extra_args['text_output']",
+            "bridge_think_text_to_image: staged stage-0 text (len=%d) into diffusion extra_args['text_output']",
             len(text),
         )
     return prompt
+
+
+def _mode_surfaces_text(prompt: Any | None) -> bool:
+    """Whether the request's mode should lift AR text into the DiT output.
+
+    Only thinking modes (``caption_generate`` / ``think_*``) surface AR text;
+    dense / edit / generate / understanding modes decode no meaningful text (or
+    a 1-token artifact when AR ``max_tokens`` is clamped), so they must not.
+    """
+    if not isinstance(prompt, dict):
+        return False
+    mode = prompt.get("mode") or prompt.get("sensenova_vision_mode")
+    return mode in THINK_TEXT_MODES
 
 
 def _extract_stage0_text(source_outputs: list[Any]) -> str | None:
@@ -150,6 +174,7 @@ def _extract_stage0_text(source_outputs: list[Any]) -> str | None:
 __all__ = [
     "build_think_prompt",
     "bridge_think_text_to_image",
+    "THINK_TEXT_MODES",
     "GEN_THINK_SYSTEM_PROMPT",
     "VLM_THINK_SYSTEM_PROMPT",
 ]

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-Vision-7B-MoT offline inference (full modality matrix).
 
 SenseNova-Vision is a Bagel-fork MoT model; the diffuser reads the SenseNovaVision
@@ -103,32 +103,31 @@ CAMERA_POSE_PROMPT = (
 
 UNDERSTANDING_PROMPT = "What are the main objects in this scene and their relationships?"
 DEPTH_PROMPT = (
-    "<image> Estimate relative depth for each pixel in the image, with closer "
+    "Estimate relative depth for each pixel in the image, with closer "
     "objects appearing brighter and distant objects appearing darker. Output "
     "is a grayscale image with pixel values ranging from 0-255."
 )
 NORMAL_PROMPT = (
-    "<image> Generate an RGB normal map where R, G, B channels represent X, Y, "
+    "Generate an RGB normal map where R, G, B channels represent X, Y, "
     "Z surface directions. The output should show continuous color variations "
     "with no discrete regions, unlike segmentation results."
 )
 SEGMENTATION_PROMPT = (
-    "<image> Could you return the binary segmentation masks for the specified "
-    "categories: <p>person furthest to the right</p>?"
+    "Could you return the binary segmentation masks for the specified categories: <p>person furthest to the right</p>?"
 )
 DETECTION_PROMPT = (
-    "<image> Please detect all instances of <p>bird</p>, <p>boat</p>, "
+    "Please detect all instances of <p>bird</p>, <p>boat</p>, "
     "<p>person</p>, <p>cell phone</p>, <p>backpack</p>, <p>handbag</p> in the "
     "image. Output the results as a structured text list with each detection "
     "including category and bounding box coordinates in <bbox> format."
 )
 OCR_PROMPT = (
-    "<image> Please recognize all the text in the image. Output the results as "
+    "Please recognize all the text in the image. Output the results as "
     "a structured text list with each detection including the recognized text "
     "and its bounding box coordinates in <bbox> format."
 )
 CAPTION_GENERATE_PROMPT = (
-    "<image> Please briefly describe the contents of the image. Please respond "
+    "Please briefly describe the contents of the image. Please respond "
     "with interleaved segmentation masks for the corresponding parts of the "
     "answer."
 )
@@ -191,6 +190,12 @@ MODALITY_MODE = {
 # Modalities that must run on the two-stage think topology: stage 0 decodes
 # its <thinking> tokens to EOS before the KV cache transfers to the DiT.
 THINK_MODALITIES = frozenset({"think-text2text", "think-text2img", "think-img2img"})
+
+# DiT-routed image-output tasks that must NOT decode AR thinking text.  For
+# these the Thinker's max_tokens is clamped to 1 so the KV transfers to the
+# DiT right after prefill (no text decode, no junk text output).  Thinking
+# modes (mixed -> caption_generate, think-*) keep the full budget.
+NON_THINK_DIT_MODALITIES = frozenset({"img2dense", "recon3d"})
 
 # Output-name prefixes per modality (deterministic filenames).
 _MODALITY_PREFIX = {
@@ -682,7 +687,11 @@ def main():
         formatted = _format_mixed_prompts(prompts, image)
 
     params_list = omni.default_sampling_params_list
-    diffusion_params = params_list[0]  # single-stage: one param set
+    # The (think) topology is two-stage: params_list[0] is the Thinker's
+    # SamplingParams, params_list[1] is the DiT's OmniDiffusionSamplingParams.
+    # Diffusion knobs belong on the DiT stage; the Thinker only gets a
+    # per-request max_tokens clamp for non-think DiT-routed modalities.
+    diffusion_params = params_list[1] if len(params_list) >= 2 else params_list[0]
     diffusion_params.num_inference_steps = args.steps  # type: ignore
     if args.seed is not None:
         diffusion_params.seed = args.seed  # type: ignore
@@ -724,6 +733,12 @@ def main():
         except json.JSONDecodeError as e:
             raise ValueError(f"--extra-args must be valid JSON: {e}") from e
     diffusion_params.extra_args = extra  # type: ignore
+
+    # Per-request AR think gating: clamp the Thinker's max_tokens to 1 for
+    # non-think DiT-routed tasks so the KV transfers to the DiT right after
+    # prefill (skip the AR text decode).  Thinking modes keep the full budget.
+    if len(params_list) >= 2 and args.modality in NON_THINK_DIT_MODALITIES:
+        params_list[0].max_tokens = 1  # type: ignore
 
     outputs = list(omni.generate(prompts=formatted, sampling_params_list=params_list))
     prefix = _MODALITY_PREFIX[args.modality]

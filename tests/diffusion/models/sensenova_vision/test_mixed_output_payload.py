@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the SenseNovaVision mixed text+image output contract.
 
 SenseNovaVision ``caption_generate`` / ``think_generate`` produce an image together
@@ -251,7 +251,13 @@ def _merged_output(think_text: str | None = None) -> DiffusionOutput:
 
 
 def test_merge_uses_extra_args_when_metadata_has_no_text() -> None:
-    """``forward`` falls back to request ``extra_args["text_output"]``."""
+    """``forward`` falls back to request ``extra_args["text_output"]`` for a thinking mode.
+
+    The fallback is gated on ``extra_args["think"]`` (injected from the mode's
+    ``_BASE_PARAMS`` by ``_apply_mode_defaults``): only thinking modes surface
+    an AR-supplied caption string.  ``caption_generate``/``think_generate`` set
+    ``think: True``.
+    """
     output = _merged_output()
     req = DiffusionRequestBatch(
         requests=[
@@ -260,7 +266,7 @@ def test_merge_uses_extra_args_when_metadata_has_no_text() -> None:
                 request_id="req-mixed",
                 sampling_params=OmniDiffusionSamplingParams(
                     num_inference_steps=1,
-                    extra_args={"text_output": "text from extra args"},
+                    extra_args={"text_output": "text from extra args", "think": True},
                 ),
             )
         ]
@@ -269,6 +275,33 @@ def test_merge_uses_extra_args_when_metadata_has_no_text() -> None:
 
     assert merged.output["payload"]["text"] == "text from extra args"
     assert merged.output["metadata"]["text"]["text_output"] == "text from extra args"
+
+
+def test_merge_does_not_surface_extra_args_text_for_non_think_mode() -> None:
+    """A non-think mode (think falsy) must NOT lift ``extra_args["text_output"]``.
+
+    This is the DiT-side safety net for the per-request AR ``max_tokens=1``
+    clamp: dense_perception / recon3d carry no ``think`` flag, so a stray
+    1-token AR decode must never surface as text even if the bridge staged it.
+    """
+    output = _merged_output()
+    req = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="generate",
+                request_id="req-dense",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    extra_args={"text_output": "1-token artifact"},
+                ),
+            )
+        ]
+    )
+    merged = _make_pipeline()._merge_mixed_task_text(req, output)
+
+    assert merged is output
+    assert "text" not in merged.output["payload"]
+    assert merged.output["metadata"] == {}
 
 
 def test_merge_leaves_payload_unchanged_without_text() -> None:

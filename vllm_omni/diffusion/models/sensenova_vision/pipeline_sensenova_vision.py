@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-Vision-7B-MoT diffusion pipeline.
 
 SenseNova-Vision is a Bagel fork; the denoising model, VAE, and ViT are
@@ -447,9 +447,7 @@ class SenseNovaVisionPipeline(BagelPipeline):
         )
 
         if params.seed is not None:
-            torch.manual_seed(params.seed)
-            if self.device.type == "cuda":
-                torch.cuda.manual_seed(params.seed)
+            torch.Generator(device=self.device.type).manual_seed(params.seed)
 
         with torch.autocast(
             device_type=self.device.type,
@@ -508,9 +506,14 @@ class SenseNovaVisionPipeline(BagelPipeline):
                 text = text_group.get("text_output") or text_group.get("think_text")
         if text is None:
             extra_args = getattr(req.sampling_params, "extra_args", None) or {}
-            candidate = extra_args.get("text_output")
-            if isinstance(candidate, str) and candidate:
-                text = candidate
+            # Only lift an AR-supplied caption for thinking modes.  ``think``
+            # is injected by ``_apply_mode_defaults`` from the mode's
+            # ``_BASE_PARAMS``; dense/edit/generate modes are False, so a stray
+            # 1-token AR decode (max_tokens=1) must never surface as text.
+            if extra_args.get("think"):
+                candidate = extra_args.get("text_output")
+                if isinstance(candidate, str) and candidate:
+                    text = candidate
         if text is None:
             return output
 
