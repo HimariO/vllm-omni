@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Dense-image decoders for SenseNova-Vision.
 
 The model returns dense predictions as ordinary images:
@@ -35,6 +38,22 @@ __all__ = [
     "decode_normal",
     "decode_point_map",
 ]
+
+
+def _remap_raw_to_byte(arr: np.ndarray) -> np.ndarray:
+    """Remap a raw VAE-space array to byte scale while leaving byte data alone.
+
+    Float arrays whose values lie inside the model's VAE output range
+    (``[-1, 1]``, the ``output_raw_tensor=True`` representation) are treated
+    as raw tensors and shifted back to ``[0, 255]`` via ``(x + 1) / 2 * 255``
+    so the 8-bit decode math below stays correct.  Integer arrays and float
+    arrays that already span a byte-like range are returned unchanged.
+    """
+    if arr.dtype.kind in "iu" or arr.size == 0:
+        return arr
+    if arr.min() < -1.0 - 1e-6 or arr.max() > 1.0 + 1e-6:
+        return arr
+    return (arr.astype(np.float32) + 1.0) / 2.0 * 255.0
 
 
 def _to_rgb_array(image: ImageLike) -> np.ndarray:
@@ -101,6 +120,8 @@ def decode_segmentation(
     Returns:
         An int32/uint8 class-index mask array with shape ``(H, W)``.
     """
+    if isinstance(image, np.ndarray):
+        image = _remap_raw_to_byte(image)
     if class_define is not None:
         palette = np.asarray(class_define, dtype=np.float32)
         if palette.ndim != 2 or palette.shape[1] != 3:
@@ -153,7 +174,7 @@ def decode_depth(
         arr = np.asarray(image.convert("RGB"), dtype=np.float32)
         return np.mean(arr, axis=2) / 255.0
 
-    arr = np.asarray(image, dtype=np.float32)
+    arr = _remap_raw_to_byte(np.asarray(image, dtype=np.float32))
     if arr.ndim == 3 and arr.shape[2] >= 3:
         arr = arr[:, :, :3]
     elif arr.ndim == 2:
@@ -205,7 +226,7 @@ def decode_normal(
             image = image.resize(size, resample=resample)
         arr = np.asarray(image.convert("RGB"), dtype=np.float32)
     else:
-        arr = np.asarray(image, dtype=np.float32)
+        arr = _remap_raw_to_byte(np.asarray(image, dtype=np.float32))
         if arr.ndim == 2:
             arr = np.repeat(arr[:, :, None], 3, axis=2)
         if arr.ndim != 3 or arr.shape[2] != 3:

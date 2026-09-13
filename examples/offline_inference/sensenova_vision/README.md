@@ -164,6 +164,15 @@ The example builds the two-stage engine with the default deploy config
 `vllm_omni/deploy/sensenova_vision.yaml` (Thinker + DiT sharing GPU 0). To use a
 custom topology or device layout, pass `--deploy-config /path/to/config.yaml`.
 
+By default image outputs are 8-bit ONGs. For offline evaluation of
+`img2dense` / `recon3d` you can opt into the raw VAE tensors (the official
+`inferencer.decode_image(..., output_raw_tensor=True)` float output) with
+`--output-type raw_tensor`: the pipeline returns raw float32 HxWx3 arrays,
+saved as `.npy` instead of `.png`, and the decoders are range-aware
+(`decode_point_map` passes raw arrays through, `decode_depth` /
+`decode_normal` / `decode_segmentation` remap `[-1, 1]` VAE space to byte
+scale before decoding, so the maps match the 8-bit path exactly).
+
 Generation knobs mirror the SenseNovaVision per-mode `BASE_PARAMS`: `--steps`,
 `--seed`, `--height`, `--width`, `--cfg-text-scale`, `--cfg-img-scale`,
 `--timestep-shift`, `--max-think-tokens`, and `--extra-args` (JSON object for

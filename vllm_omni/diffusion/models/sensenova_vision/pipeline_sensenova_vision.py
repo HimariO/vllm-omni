@@ -20,8 +20,10 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
+import PIL.Image
 import torch
 from vllm.logger import init_logger
 
@@ -42,9 +44,15 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 # SenseNova-Vision layer as the single canonical copy shared by the AR stage
 # (vllm_omni/engine/arg_utils.py) and this DiT stage so the two stages stay
 # in lockstep.
+from vllm_omni.model_executor.models.sensenova_vision.cfg_expand import IMG2IMG_PLACEHOLDER
 from vllm_omni.model_executor.models.sensenova_vision.configuration_sensenova_vision import (
     SENSENOVA_VISION_PREPROCESSOR_CONFIG as _SENSENOVA_VISION_PREPROCESSOR_CONFIG,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.models.bagel.autoencoder import AutoEncoder
+    from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
 
@@ -353,9 +361,16 @@ class SenseNovaVisionPipeline(BagelPipeline):
         multi-view image decode directly (``image_sizes`` length-N,
         ``packed_seqlens`` length-N, ``generate_image`` returns N unpacked
         latents).  SenseNovaVision only needs to branch the AR-supplied KV
-        context across those ``N`` view branches and emit one PIL image per
+        context across those ``N`` view branches and emit one image per
         view.  ``recon3d`` is the first task to request this; all other modes
         delegate to the BAGEL core unchanged.
+
+        The BAGEL core already decodes latents through the instance method
+        :meth:`_decode_image_from_latent`: when the request opts into
+        ``output_type="raw_tensor"`` (see :meth:`_should_return_raw_tensor`)
+        the override returns raw HxWx3 float32 VAE tensors (upstream
+        ``output_raw_tensor=True``) instead of 8-bit PIL images, for every
+        image-producing mode including ``recon3d``.
         """
         injected_kv = req.sampling_params.past_key_values
         if injected_kv is not None:
@@ -367,11 +382,46 @@ class SenseNovaVisionPipeline(BagelPipeline):
         return self._merge_mixed_task_text(req, output)
 
     @staticmethod
+    def _should_return_raw_tensor(params: OmniDiffusionSamplingParams) -> bool:
+        """True when the request opts into raw float32 tensor image outputs.
+
+        Reads the request-scoped ``output_type`` knob (request-scoped so the
+        OpenAI-compatible server, which sets no such flag, always keeps the
+        PIL decode): ``params.output_type`` is the canonical field; the
+        ``extra_args["output_type"]`` fallback supports callers that only
+        speak ``extra_args``.  ``"raw_tensor"`` is the only raw mode; any
+        other value (including ``None``/Wan's ``"latent"``/``"np"``) keeps
+        the default PIL behavior.
+        """
+        output_type = getattr(params, "output_type", None)
+        if output_type is None:
+            extra_args = getattr(params, "extra_args", None) or {}
+            output_type = extra_args.get("output_type")
+        return output_type == "raw_tensor"
+
+    @staticmethod
     def _is_recon3d(req: DiffusionRequestBatch) -> bool:
         """True when the request selects the multi-view ``recon3d`` mode."""
         params = getattr(req, "sampling_params", None)
         extra_args = getattr(params, "extra_args", None) or {}
         return bool(extra_args.get("sensenova_vision_mode") == "recon3d")
+
+    @staticmethod
+    def _count_conditioned_views(req: DiffusionRequestBatch) -> int:
+        """Number of VAE+ViT conditioning blocks in the recon3d prompt.
+
+        Each input view contributes exactly one ``<|fim_middle|>`` marker
+        (``_format_recon3d_prompts`` builds the marker block per view, and the
+        orchestrator hands the original prompt dict to this stage unchanged),
+        so the marker count equals the number of conditioned views.  Counting
+        markers also stays correct when ``multi_modal_data`` is dropped on the
+        AR->DiT stage boundary.
+        """
+        prompts = getattr(req, "prompts", None) or []
+        prompt = prompts[0] if prompts else None
+        if not isinstance(prompt, dict):
+            return 0
+        return str(prompt.get("prompt", "")).count(IMG2IMG_PLACEHOLDER)
 
     def _forward_recon3d(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Multi-view ``recon3d`` decode: one AR context, N output views.
@@ -384,25 +434,41 @@ class SenseNovaVisionPipeline(BagelPipeline):
         denoised ``x_t`` by ``packed_seqlens - 2`` into ``num_views`` latent
         branches, which this override decodes individually.
 
-        Precision note: upstream ``decode_image(..., output_raw_tensor=True)``
-        returns the raw float VAE tensor; this pipeline emits standard 8-bit
-        PIL images (via :meth:`BagelPipeline._decode_image_from_latent`), an
-        accepted fidelity trade-off for the serving path.  Downstream example
-        rewrites re-map these back to float point maps.
+        Fidelity note: unless the request opts into
+        ``output_type="raw_tensor"`` the views are 8-bit PIL images
+        (matching upstream ``decode_image(output_raw_tensor=False)``); with
+        the flag set, :meth:`_decode_latent_raw` returns the float32 VAE
+        tensors exactly like upstream ``decode_image(...,
+        output_raw_tensor=True)``, so point-map evaluators keep full float
+        precision without an 8-bit round-trip.
         """
         params = req.sampling_params
         extra_args = getattr(params, "extra_args", None) or {}
 
-        # ``num_output_vae`` in upstream ``gen_image``.  SenseNovaVision logs
-        # 4-view recon3d by default; ``num_views`` is the per-request knob.
-        num_views = int(extra_args.get("num_views", 4))
+        # ``num_output_vae`` in upstream ``gen_image``.  Upstream
+        # ``reconstruct_3d`` runs with ``output_multiple_vae=True`` so
+        # ``interleave_inference`` derives it from the input view count
+        # (``max(input_image_count, 1)``) and every input view gets one point
+        # map; mirror that here by defaulting to the number of conditioned
+        # views (the ``<|fim_middle|>`` VAE+ViT blocks in the prompt) instead
+        # of a hardcoded 4.  ``num_views`` stays the explicit per-request
+        # override (e.g. end2end.py --num-views) and must cover every
+        # conditioned view.
+        num_conditioned_views = self._count_conditioned_views(req)
+        num_views = int(extra_args.get("num_views", max(num_conditioned_views, 1)))
         if num_views < 1:
             raise ValueError(f"recon3d requires num_views >= 1, got {num_views}.")
+        if num_views < num_conditioned_views:
+            raise ValueError(
+                f"recon3d conditioned on {num_conditioned_views} view(s) but num_views "
+                f"is {num_views}; the output view count must cover every conditioned view."
+            )
 
         # The multi-view decode continues from the AR KV context.  Without an
         # injected cache there is no conditioning to branch from.
         injected_kv = getattr(params, "past_key_values", None)
         if injected_kv is None:
+            # TODO: add support for single stage pipeline later
             raise ValueError("recon3d requires an injected KV cache (past_key_values).")
         gen_cache = NaiveCache.from_object(injected_kv)
         kv_len = gen_cache.key_cache[0].shape[0]
@@ -446,6 +512,85 @@ class SenseNovaVisionPipeline(BagelPipeline):
             cfg_renorm_min=float(extra_args.get("cfg_renorm_min", 0.0)),
         )
 
+        # Build the CFG branch inputs exactly like the standard BAGEL path
+        # (``pipeline_bagel._forward_single``: prepare_vae_latent_cfg for both
+        # branches, then pass cfg_*_packed_position_ids and cfg_*_past_key_values
+        # into ``generate_image``) and upstream ``InterleaveInferencer.gen_image``
+        # (``inferencer.py:168-222``).  The AR stage prefills all companion
+        # requests (gen / cfg_text / cfg_img); recon3d must feed matching branch
+        # position-ids and KV caches back into the BAGEL core, otherwise the
+        # sequential-CFG/SP path dereferences a None branch pid.
+        #
+        # Each CFG branch shares the same multi-view latent layout as the gen
+        # branch: ``kv_lens_cfg + [0]*(num_views-1)``, ``rope + 0..num_views-1``.
+        use_cfg_text = gen_params.cfg_text_scale > 1.0
+        use_cfg_img = use_cfg_text and gen_params.cfg_img_scale > 1.0
+
+        # gen branch: also the branch that continues the AR context.  For
+        # recon3d the gen branch is the full context (all views + prompt).
+        gen_cfg_context = {"kv_lens": [kv_len], "ropes": [base_rope], "past_key_values": gen_cache}
+
+        def _branch_context(
+            kv_attr: str,
+            metadata_attr: str,
+            default_context: dict[str, Any],
+        ) -> dict[str, Any]:
+            """Resolve one CFG branch context from the transferred companion KV.
+
+            Falls back to the gen branch (full AR context) when the companion
+            was not transferred, mirroring ``pipeline_bagel`` where the text-
+            unconditional / no-image branches reuse the gen KV.
+            """
+            kv = getattr(params, kv_attr, None)
+            if kv is None:
+                return default_context
+            cache = NaiveCache.from_object(kv)
+            seq_len = cache.key_cache[0].shape[0]
+            metadata = getattr(params, metadata_attr, None) or {}
+            rope = int((metadata.get("ropes") or [seq_len])[0])
+            # The CFG branch cache feeds the same multi-view packed forward as
+            # the gen branch: ``_forward_gen`` splits the merged cache once per
+            # packed sequence (``batched_seqlens`` = ``packed_seqlens`` repeated
+            # ``num_branches`` times, i.e. ``num_views * num_branches`` entries),
+            # so each branch cache must expose the same per-view split
+            # (``[seq_len, 0, ..., 0]``) as the gen cache, otherwise the merge
+            # produces the wrong number of ``key_values_lens`` entries and
+            # ``split_with_zeros`` indexing goes out of range.
+            cache.key_values_lens = [seq_len] + [0] * (num_views - 1)
+            return {"kv_lens": [seq_len], "ropes": [rope], "past_key_values": cache}
+
+        # cfg_text branch: unconditional text.  Upstream clones gen_context
+        # right BEFORE the last prompt string is added (so it holds all views
+        # but no prompt text); in the staged AR->DiT flow this is the
+        # ``__cfg_text`` companion KV.
+        cfg_text_context = _branch_context("cfg_text_past_key_values", "cfg_text_kv_metadata", gen_cfg_context)
+
+        # cfg_img branch: same text as gen but WITHOUT image conditioning.  For
+        # text2img the upstream / BAGEL paths reuse the gen KV here
+        # (``pipeline_bagel.py:639-649``); recon3d has no separate no-image
+        # preconditioned context either, so reuse the gen branch KV when the
+        # ``__cfg_img`` companion was not transferred.
+        cfg_img_context = _branch_context("cfg_img_past_key_values", "cfg_img_kv_metadata", gen_cfg_context)
+
+        def _cfg_pids(context: dict[str, Any]) -> torch.Tensor:
+            """Multi-view CFG branch position-ids (mirrors prepare_vae_latent_cfg)."""
+            cfg_kv_lens, cfg_ropes = context["kv_lens"], context["ropes"]
+            pids = self.bagel.prepare_vae_latent_cfg(
+                curr_kvlens=cfg_kv_lens + [0] * (num_views - 1),
+                curr_rope=list(cfg_ropes[0] + x for x in range(num_views)),
+                image_sizes=[image_shape] * num_views,
+            )
+            return pids["cfg_packed_position_ids"].to(self.device)
+
+        cfg_branch_inputs: dict[str, Any] = {}
+        cfg_branch_caches: dict[str, Any] = {}
+        if use_cfg_text:
+            cfg_branch_inputs["cfg_text_packed_position_ids"] = _cfg_pids(cfg_text_context)
+            cfg_branch_caches["cfg_text_past_key_values"] = cfg_text_context["past_key_values"]
+        if use_cfg_img:
+            cfg_branch_inputs["cfg_img_packed_position_ids"] = _cfg_pids(cfg_img_context)
+            cfg_branch_caches["cfg_img_past_key_values"] = cfg_img_context["past_key_values"]
+
         if params.seed is not None:
             torch.Generator(device=self.device.type).manual_seed(params.seed)
 
@@ -467,17 +612,72 @@ class SenseNovaVisionPipeline(BagelPipeline):
                 scheduler=self.scheduler,
                 scheduler_kwargs=self.scheduler_kwargs,
                 **generation_input,
+                **cfg_branch_inputs,
+                **cfg_branch_caches,
             )
 
-        # 8-bit decode: each view branch is a ``(h*w, latent_channel*patch^2)``
+        # Per-view decode: each view branch is a ``(h*w, latent_channel*patch^2)``
         # latent reshaped to the shared image_shape and passed to the VAE
-        # decoder.  Upstream emits raw float32 tensors here; we accept the
-        # 8-bit PIL representation (see method docstring).
-        images = [self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in latents]
+        # decoder.  ``_decode_image_from_latent`` returns raw float32 tensors
+        # when the request opts into ``output_type="raw_tensor"``, else the
+        # standard 8-bit PIL image (see method docstring).
+        images = [self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape, params) for lat in latents]
         return build_sensenova_vision_diffusion_output(
             image=images,
             stage_durations=getattr(self, "stage_durations", None),
         )
+
+    def _decode_latent_raw(
+        self,
+        bagel: Bagel,
+        vae: AutoEncoder,
+        latent: torch.Tensor,
+        image_shape: tuple[int, int],
+    ) -> np.ndarray:
+        """Decode a latent to a raw HxWx3 float32 array (upstream ``output_raw_tensor=True``).
+
+        Mirrors :meth:`BagelPipeline._decode_image_from_latent` but returns
+        the VAE output itself instead of an 8-bit PIL image: the einsum
+        unpack + VAE dtype cast are identical, only the float-normalized
+        clamp and ``uint8`` conversion are skipped, matching upstream
+        ``decode_image(latent, image_shape, output_raw_tensor=True)`` which
+        returns ``image[0].permute(1, 2, 0).float().cpu().numpy()``.
+        """
+        H, W = image_shape
+        h, w = H // bagel.latent_downsample, W // bagel.latent_downsample
+        p = bagel.latent_patch_size
+        c = bagel.latent_channel
+        latent = latent.reshape(1, h, w, p, p, c)
+        latent = torch.einsum("nhwpqc->nchpwq", latent)
+        latent = latent.reshape(1, c, h * p, w * p)
+
+        # Cast to VAE dtype (e.g. bfloat16) as latents might remain float32 from generation loop
+        vae_dtype = next(vae.parameters()).dtype
+        latent = latent.to(vae_dtype)
+
+        image = vae.decode(latent)
+        return np.asarray(image[0].permute(1, 2, 0).float().cpu())
+
+    def _decode_image_from_latent(
+        self,
+        bagel: Bagel,
+        vae: AutoEncoder,
+        latent: torch.Tensor,
+        image_shape: tuple[int, int],
+        params: OmniDiffusionSamplingParams | None = None,
+    ) -> PIL.Image.Image | np.ndarray:
+        """Decode a latent to an image, dispatching on the request raw-tensor flag.
+
+        The BAGEL core decodes every image-producing mode (text2img, img2img,
+        dense, edit, mixed, think-*) through this method; ``_forward_recon3d``
+        calls it once per view.  Default behavior is unchanged (8-bit PIL via
+        ``super()``); only a request that opted into
+        ``output_type="raw_tensor"`` receives the raw HxWx3 float32 array.
+        """
+        if self._should_return_raw_tensor(params):
+            logger.info(f"[SenseNova-Vision] return raw tensor: {params=}")
+            return self._decode_latent_raw(bagel, vae, latent, image_shape)
+        return super()._decode_image_from_latent(bagel, vae, latent, image_shape)
 
     def _merge_mixed_task_text(self, req: DiffusionRequestBatch, output: DiffusionOutput) -> DiffusionOutput:
         """Lift an available caption/think string into the mixed text+image payload.

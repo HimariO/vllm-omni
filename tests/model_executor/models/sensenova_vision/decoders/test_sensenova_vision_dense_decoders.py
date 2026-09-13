@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for SenseNova-Vision dense-image decoders."""
 
 from __future__ import annotations
@@ -159,3 +159,71 @@ def test_decode_point_map_pil_image():
     assert out.shape == (4, 4, 3)
     assert out.dtype == np.float32
     assert np.allclose(out, 128.0 / 255.0 * 2.0 - 1.0, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Raw VAE-tensor (output_type="raw_tensor") input support, ~[-1, 1] space
+# ---------------------------------------------------------------------------
+
+
+def test_decode_depth_raw_float32_range_matches_uint8():
+    """A raw VAE-space depth map decodes identically to its 8-bit equivalent.
+
+    Raw float arrays in ``[-1, 1]`` (upstream ``output_raw_tensor=True``) are
+    shifted back to byte scale first, so the Marigold-style ``mean/255`` math
+    yields the same relative depth in ``[0, 1]``.
+    """
+    raw = np.zeros((8, 8, 3), dtype=np.float32)
+    raw[:] = 128.0 / 255.0 * 2.0 - 1.0  # == byte 128
+    depth = decode_depth(raw)
+    assert depth.shape == (8, 8)
+    assert np.allclose(depth, 128.0 / 255.0, atol=1e-6)
+
+
+def test_decode_depth_raw_2d_input():
+    """A grayscale raw depth map (HxW) is range-remapped before decoding."""
+    raw = np.full((6, 6), 64.0 / 255.0 * 2.0 - 1.0, dtype=np.float32)
+    depth = decode_depth(raw)
+    assert depth.shape == (6, 6)
+    assert np.allclose(depth, 64.0 / 255.0, atol=1e-6)
+
+
+def test_decode_normal_raw_float32_matches_uint8():
+    """A raw VAE-space normal map decodes to the same unit normals as 8-bit."""
+    # +z encoded as byte (0,0,255); raw equivalent = (byte/255*2-1).
+    # NB: raw -1.0 maps to byte 0, raw 1.0 to byte 255.
+    raw = np.full((4, 4, 3), -1.0, dtype=np.float32)
+    raw[:, :, 2] = 1.0  # -> byte (0, 0, 255)
+    normals = decode_normal(raw)
+    assert normals.shape == (4, 4, 3)
+    # Same as the 8-bit path: (-1,-1,1) after remap, then flip x -> (1,-1,1).
+    assert np.allclose(normals[:, :, 0], 1.0)
+    assert np.allclose(normals[:, :, 1], -1.0)
+    assert np.allclose(normals[:, :, 2], 1.0)
+
+
+def test_decode_normal_raw_no_flip_x():
+    raw = np.full((4, 4, 3), -1.0, dtype=np.float32)
+    raw[:, :, 2] = 1.0
+    normals = decode_normal(raw, flip_x=False)
+    assert np.allclose(normals[:, :, 0], -1.0)
+
+
+def test_decode_segmentation_raw_binary_threshold():
+    """A raw binary mask (>0.5 in [-1,1] == >127 in [0,255]) threshold-decodes."""
+    raw = np.full((8, 8), -1.0, dtype=np.float32)  # byte 0
+    raw[:, :4] = 1.0  # byte 255
+    mask = decode_segmentation(raw, threshold=127)
+    assert (mask[:, :4] == 1).all()
+    assert (mask[:, 4:] == 0).all()
+
+
+def test_decode_segmentation_raw_rgb_classes():
+    """Raw VAE-space RGB masks map to the same nearest-palette classes."""
+    raw = np.zeros((8, 8, 3), dtype=np.float32)
+    raw[:, :4, 0] = 1.0  # red class 0
+    raw[:, 4:, 1] = 1.0  # green class 1
+    class_define = [(255, 0, 0), (0, 255, 0)]
+    mask = decode_segmentation(raw, class_define=class_define)
+    assert (mask[:, :4] == 0).all()
+    assert (mask[:, 4:] == 1).all()

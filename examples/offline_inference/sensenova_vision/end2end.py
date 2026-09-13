@@ -246,6 +246,13 @@ def parse_args() -> argparse.Namespace:
         default="depth",
         help="Dense prediction task for --modality img2dense.",
     )
+    p.add_argument(
+        "--output-type",
+        choices=["pil", "raw_tensor"],
+        default="pil",
+        help="Image output format: 'pil' (8-bit PNG, default) or 'raw_tensor' "
+        "(raw float32 HxWx3 VAE tensors, upstream output_raw_tensor=True; saved as .npy).",
+    )
     p.add_argument("--height", type=int, default=None, help="Image height (image-output modes).")
     p.add_argument("--width", type=int, default=None, help="Image width (image-output modes).")
     p.add_argument("--output", type=str, default=".", help="Output directory.")
@@ -544,13 +551,24 @@ def _write_text(output_dir, prefix, index, text) -> str:
 
 
 def _write_image(output_dir, prefix, index, image) -> str:
+    import numpy as np
+
+    if isinstance(image, np.ndarray):
+        # Raw-tensor mode: persist the raw float32 array as-is (.npy).
+        path = os.path.join(output_dir, f"{prefix}_{index}.npy")
+        np.save(path, image)
+        return path
     path = os.path.join(output_dir, f"{prefix}_{index}.png")
     image.save(path)
     return path
 
 
 def _decode_and_write_dense(output_dir, prefix, index, image, dense_task):
-    """Decode a dense prediction image with the SenseNovaVision decoders and save it."""
+    """Decode a dense prediction image with the SenseNovaVision decoders and save it.
+
+    Both 8-bit PIL images and raw float32 ``output_type=raw_tensor`` arrays
+    are accepted; the decoders are range-aware and handle either.
+    """
     import numpy as np
 
     from vllm_omni.model_executor.models.sensenova_vision.decoders import (
@@ -577,7 +595,12 @@ def _decode_and_write_dense(output_dir, prefix, index, image, dense_task):
 
 
 def _decode_and_write_recon3d(output_dir, prefix, index, images):
-    """Decode each per-view point map and optionally save the intermediate text."""
+    """Decode each per-view point map and optionally save the intermediate text.
+
+    Each view may be an 8-bit PIL image or a raw float32 HxWx3 array
+    (``output_type=raw_tensor``); ``decode_point_map`` is range-aware and
+    passes raw arrays through unchanged.
+    """
     import numpy as np
 
     from vllm_omni.model_executor.models.sensenova_vision.decoders import decode_point_map
@@ -695,6 +718,8 @@ def main():
     diffusion_params.num_inference_steps = args.steps  # type: ignore
     if args.seed is not None:
         diffusion_params.seed = args.seed  # type: ignore
+    if args.output_type == "raw_tensor" or args.modality == "recon3d":
+        diffusion_params.output_type = "raw_tensor"  # type: ignore
 
     extra = getattr(diffusion_params, "extra_args", {}) or {}
 

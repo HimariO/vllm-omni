@@ -171,6 +171,27 @@ python examples/offline_inference/sensenova_vision/end2end.py \
 Outputs are written to `--output` with deterministic names (`text2img_0.png`,
 `img2text_0.txt`, `img2dense_0_depth.npy`, `recon3d_0_view0.npy`, ...).
 
+By default image outputs are 8-bit ONGs. Offline evaluation of dense/recon3d
+can opt into the raw VAE tensors (the official
+`inferencer.decode_image(..., output_raw_tensor=True)` float output) with
+`--output-type raw_tensor`: the pipeline then returns raw float32 HxWx3
+arrays, saved as `.npy` instead of `.png`. The dense decoders
+(`decode_depth` / `decode_normal` / `decode_segmentation` / `decode_point_map`)
+accept both representations — raw arrays in `[-1, 1]` VAE space are
+range-remapped so the decoded maps match the 8-bit path exactly and keep full
+float precision:
+
+```bash
+python examples/offline_inference/sensenova_vision/end2end.py \
+  --modality recon3d \
+  --output-type raw_tensor \
+  --image-path /path/to/view1.png /path/to/view2.png /path/to/view3.png \
+  --output /tmp/sensenova_vision
+```
+
+The OpenAI-compatible server always requests PIL images and is unaffected by
+the offline-only flag.
+
 Model-specific generation parameters can be forwarded with the dedicated CLI
 flags (`--cfg-text-scale`, `--cfg-img-scale`, `--timestep-shift`,
 `--max-think-tokens`) or as a JSON object through `--extra-args`:

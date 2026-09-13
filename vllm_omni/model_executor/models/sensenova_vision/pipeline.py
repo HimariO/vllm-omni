@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-Vision-7B-MoT pipeline topologies.
 
 Two-stage (default):
@@ -28,7 +28,13 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-_PROC = "vllm_omni.model_executor.stage_input_processors.bagel"
+# Stage-0 CFG expansion is SenseNova-Vision-specific: the shared BAGEL
+# expanders assume single-image img2img, while this model's recon3d formatter
+# conditions on N views under multi_modal_data['img2img'] (vLLM's prompt-update
+# matcher rejects a companion whose <|fim_middle|> count does not match the
+# number of img2img items).  See vllm_omni/model_executor/models/sensenova_vision/cfg_expand.py.
+_PROC = "vllm_omni.model_executor.models.sensenova_vision.cfg_expand"
+_BAGEL_PROC = "vllm_omni.model_executor.stage_input_processors.bagel"
 _SNV_PROMPT = "vllm_omni.model_executor.models.sensenova_vision.prompt_utils"
 
 SENSENOVA_VISION_PIPELINE = PipelineConfig(
@@ -48,7 +54,7 @@ SENSENOVA_VISION_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             model_arch="OmniSenseNovaVisionForConditionalGeneration",
             engine_output_type="text",
-            prompt_expand_func=f"{_PROC}.expand_cfg_prompts",
+            prompt_expand_func=f"{_PROC}.expand_sensenova_cfg_prompts",
             omni_kv_config={
                 "need_send_cache": True,
                 "kv_transfer_criteria": {"type": "prefill_finished"},
@@ -62,7 +68,7 @@ SENSENOVA_VISION_PIPELINE = PipelineConfig(
             input_sources=(0,),
             final_output=True,
             final_output_type="image",
-            cfg_kv_collect_func=f"{_PROC}.collect_cfg_kv_caches",
+            cfg_kv_collect_func=f"{_BAGEL_PROC}.collect_cfg_kv_caches",
             omni_kv_config={"need_recv_cache": True},
         ),
     ),
@@ -84,7 +90,7 @@ SENSENOVA_VISION_THINK_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             model_arch="OmniSenseNovaVisionForConditionalGeneration",
             engine_output_type="text",
-            prompt_expand_func=f"{_PROC}.expand_cfg_prompts_think",
+            prompt_expand_func=f"{_PROC}.expand_sensenova_cfg_prompts_think",
             # The think topology does NOT transfer after prefill: the Thinker
             # decodes its <thinking> tokens to EOS first, so the KV sent to the
             # DiT includes the thought.  Hence no kv_transfer_criteria here
@@ -99,14 +105,12 @@ SENSENOVA_VISION_THINK_PIPELINE = PipelineConfig(
             input_sources=(0,),
             final_output=True,
             final_output_type="image",
-            cfg_kv_collect_func=f"{_PROC}.collect_cfg_kv_caches",
+            cfg_kv_collect_func=f"{_BAGEL_PROC}.collect_cfg_kv_caches",
             omni_kv_config={"need_recv_cache": True},
             # Lift the AR stage's decoded think text into the DiT request's
             # extra_args['text_output'] so _merge_mixed_task_text surfaces it
             # under the existing {image, text} contract (no new payload keys).
-            custom_process_input_func=(
-                f"{_SNV_PROMPT}.bridge_think_text_to_image"
-            ),
+            custom_process_input_func=(f"{_SNV_PROMPT}.bridge_think_text_to_image"),
         ),
     ),
 )
