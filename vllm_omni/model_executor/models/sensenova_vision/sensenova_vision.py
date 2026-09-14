@@ -6,7 +6,11 @@ SenseNova-Vision is a fork of Bagel with identical parameter-bearing modules.
 This class reuses the MoT/ViT/VAE embedding logic from the BAGEL integration
 and only overrides the SenseNovaVision checkpoint defaults plus the official
 VAE/ViT resize chain (``ImageTransform(1024, 512, 16)`` then
-``ImageTransform(980, 224, 14)``).
+``ImageTransform(980, 224, 14)``).  A request conditioning on more than one
+img2img image (multi-view recon3d) switches to the upstream per-task recon3d
+transforms: ``recon3d_vae_transform`` (``ImageTransform(512, 256, 16)``) for
+the VAE stage and ``recon3d_vit_transform`` (``ImageTransform(448, 224, 14)``)
+for the ViT stage, exactly like upstream ``reconstruct_3d``.
 """
 
 from __future__ import annotations
@@ -41,6 +45,19 @@ SENSENOVA_VISION_VAE_MAX_SIZE = 1024
 SENSENOVA_VISION_VAE_MIN_SIZE = 512
 SENSENOVA_VISION_VAE_STRIDE = 16
 
+# Per-task recon3d VAE transform (``sensenova_vision.py``
+# ``recon3d_vae_transform``), applied when a request conditions on more than
+# one img2img image (multi-view recon3d).  Upstream ``reconstruct_3d`` swaps
+# in ``ImageTransform(512, 256, 16)`` for every conditioned view.
+SENSENOVA_RECON3D_VAE_MAX_SIZE = 512
+SENSENOVA_RECON3D_VAE_MIN_SIZE = 256
+
+# Per-task recon3d ViT transform (``sensenova_vision.py``
+# ``recon3d_vit_transform``): applied to the already-VAE-resized multi-view
+# image.  The min side (224), stride (14) and max-pixels clamp are shared with
+# the default ViT transform; only the long-edge cap changes (980 -> 448).
+SENSENOVA_RECON3D_VIT_MAX_SIZE = 448
+
 # Official SenseNova-Vision ViT image transform (``ImageTransform(980, 224, 14)``).
 # Upstream applies this to the already-VAE-resized image.
 SENSENOVA_VISION_VIT_MAX_SIZE = 980
@@ -62,11 +79,20 @@ SENSENOVA_VISION_DEFAULT_MAX_LATENT_SIZE = 64
 SENSENOVA_VISION_DEFAULT_VIT_MAX_NUM_PATCH_PER_SIDE = 70
 
 
-def _sensenova_vae_resize_dims(img_h: int, img_w: int) -> tuple[int, int]:
-    """Stride-aligned ``(new_h, new_w)`` for ``ImageTransform(1024, 512, 16)``."""
+def _sensenova_vae_resize_dims(
+    img_h: int,
+    img_w: int,
+    *,
+    max_size: int = SENSENOVA_VISION_VAE_MAX_SIZE,
+    min_size: int = SENSENOVA_VISION_VAE_MIN_SIZE,
+) -> tuple[int, int]:
+    """Stride-aligned ``(new_h, new_w)`` for ``ImageTransform(max, min, 16)``.
+
+    Defaults reproduce the official ``ImageTransform(1024, 512, 16)`` VAE
+    transform; the recon3d multi-view path passes ``(512, 256)`` (upstream
+    ``recon3d_vae_transform``).
+    """
     stride = SENSENOVA_VISION_VAE_STRIDE
-    max_size = SENSENOVA_VISION_VAE_MAX_SIZE
-    min_size = SENSENOVA_VISION_VAE_MIN_SIZE
 
     scale = min(max_size / max(img_h, img_w), 1.0)
     scale = max(scale, min_size / min(img_h, img_w))
@@ -84,13 +110,19 @@ def _sensenova_make_divisible(value: int, stride: int) -> int:
     return max(stride, int(round(value / stride)) * stride)
 
 
-def _sensenova_vit_resize_dims(vae_h: int, vae_w: int) -> tuple[int, int]:
-    """Stride-aligned ``(vit_h, vit_w)`` for ``ImageTransform(980, 224, 14)``.
+def _sensenova_vit_resize_dims(
+    vae_h: int,
+    vae_w: int,
+    *,
+    max_size: int = SENSENOVA_VISION_VIT_MAX_SIZE,
+) -> tuple[int, int]:
+    """Stride-aligned ``(vit_h, vit_w)`` for ``ImageTransform(max, 224, 14)``.
 
     Input is the already-VAE-resized image, matching upstream
-    ``update_context_image``.
+    ``update_context_image``.  Defaults reproduce the official
+    ``ImageTransform(980, 224, 14)`` ViT transform; the recon3d multi-view
+    path passes ``max_size=448`` (upstream ``recon3d_vit_transform``).
     """
-    max_size = SENSENOVA_VISION_VIT_MAX_SIZE
     min_size = SENSENOVA_VISION_VIT_MIN_SIZE
     stride = SENSENOVA_VISION_VIT_STRIDE
 
@@ -113,9 +145,14 @@ def _sensenova_vit_resize_dims(vae_h: int, vae_w: int) -> tuple[int, int]:
     return vit_h, vit_w
 
 
-def _sensenova_vit_patch_count(vae_h: int, vae_w: int) -> int:
+def _sensenova_vit_patch_count(
+    vae_h: int,
+    vae_w: int,
+    *,
+    vit_max_size: int = SENSENOVA_VISION_VIT_MAX_SIZE,
+) -> int:
     """Aspect-aware ViT patch count for a VAE-resized image."""
-    vit_h, vit_w = _sensenova_vit_resize_dims(int(vae_h), int(vae_w))
+    vit_h, vit_w = _sensenova_vit_resize_dims(int(vae_h), int(vae_w), max_size=vit_max_size)
     return (vit_h // SENSENOVA_VISION_VIT_STRIDE) * (vit_w // SENSENOVA_VISION_VIT_STRIDE)
 
 
@@ -128,14 +165,35 @@ def _sensenova_understanding_patch_count(img_h: int, img_w: int) -> int:
     return _sensenova_vit_patch_count(vae_h, vae_w)
 
 
-def _sensenova_img2img_token_counts(img_h: int, img_w: int) -> tuple[int, int, int, int]:
+def _sensenova_img2img_token_counts(
+    img_h: int,
+    img_w: int,
+    *,
+    num_images: int = 1,
+) -> tuple[int, int, int, int]:
     """Return ``(num_vae_total, num_vit_total, vae_h, vae_w)`` for one img2img item.
 
     Totals include the ``<|vision_start|>`` / ``<|vision_end|>`` marker slots.
+    ``num_images`` mirrors the model-side gate: when the request conditions on
+    more than one img2img image (multi-view recon3d), the VAE resize uses the
+    upstream ``recon3d_vae_transform`` ``(512, 256, 16)`` target and the ViT
+    resize the ``recon3d_vit_transform`` ``(448, 224, 14)`` target, instead of
+    the default ``ImageTransform(1024, 512, 16)`` / ``(980, 224, 14)`` chain.
     """
-    vae_h, vae_w = _sensenova_vae_resize_dims(int(img_h), int(img_w))
+    if num_images > 1:
+        vae_h, vae_w = _sensenova_vae_resize_dims(
+            int(img_h),
+            int(img_w),
+            max_size=SENSENOVA_RECON3D_VAE_MAX_SIZE,
+            min_size=SENSENOVA_RECON3D_VAE_MIN_SIZE,
+        )
+        # Upstream recon3d pairs the recon3d VAE transform with
+        # ``recon3d_vit_transform`` (``ImageTransform(448, 224, 14)``).
+        num_vit_patches = _sensenova_vit_patch_count(vae_h, vae_w, vit_max_size=SENSENOVA_RECON3D_VIT_MAX_SIZE)
+    else:
+        vae_h, vae_w = _sensenova_vae_resize_dims(int(img_h), int(img_w))
+        num_vit_patches = _sensenova_vit_patch_count(vae_h, vae_w)
     num_vae_patches = (vae_h // SENSENOVA_VISION_VAE_STRIDE) * (vae_w // SENSENOVA_VISION_VAE_STRIDE)
-    num_vit_patches = _sensenova_vit_patch_count(vae_h, vae_w)
     return num_vae_patches + 2, num_vit_patches + 2, vae_h, vae_w
 
 
@@ -226,13 +284,19 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
 
             def get_img2img_replacement(item_idx: int):
                 h, w = default_h, default_w
+                num_images = 0
                 if "img2img" in mm_items:
                     item = mm_items.get_items("img2img", (Img2ImgProcessorItems, ImageEmbeddingItems))
+                    # Same gate as the runtime embeds (``_process_img2img_input``):
+                    # more than one img2img item in the request switches the VAE
+                    # resize to the recon3d transform, so placeholder token counts
+                    # keep matching the embedded VAE patches.
+                    num_images = item.get_count()
                     if hasattr(item, "get_image_size"):
                         size = item.get_image_size(item_idx)
                         h, w = int(size.height), int(size.width)
 
-                num_vae_total, num_vit_total, _, _ = _sensenova_img2img_token_counts(h, w)
+                num_vae_total, num_vit_total, _, _ = _sensenova_img2img_token_counts(h, w, num_images=num_images)
                 # Keep BAGEL's separator so extract_embeds_range() yields two
                 # distinct mm_prefix ranges (VAE vs ViT) for M-RoPE / MoT.
                 total = num_vae_total + 1 + num_vit_total
@@ -309,10 +373,47 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
             )
         return pixel_values
 
+    def _resize_to_recon3d_vae(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Resize to the upstream recon3d VAE grid (``ImageTransform(512, 256, 16)``).
+
+        Multi-view recon3d conditioning (>1 img2img image) uses the upstream
+        per-task ``recon3d_vae_transform`` instead of the checkpoint default
+        (see :meth:`_process_img2img_input`); the ViT stage correspondingly
+        swaps to ``_resize_to_recon3d_vit``.
+        """
+        h, w = pixel_values.shape[2], pixel_values.shape[3]
+        new_h, new_w = _sensenova_vae_resize_dims(
+            h,
+            w,
+            max_size=SENSENOVA_RECON3D_VAE_MAX_SIZE,
+            min_size=SENSENOVA_RECON3D_VAE_MIN_SIZE,
+        )
+        if new_h != h or new_w != w:
+            pixel_values = torch.nn.functional.interpolate(
+                pixel_values, size=(new_h, new_w), mode="bicubic", align_corners=False
+            )
+        return pixel_values
+
     def _resize_for_vit(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Resize an already-VAE-resized image with ``ImageTransform(980, 224, 14)``."""
         h, w = pixel_values.shape[2], pixel_values.shape[3]
         vit_h, vit_w = _sensenova_vit_resize_dims(h, w)
+        if vit_h != h or vit_w != w:
+            pixel_values = torch.nn.functional.interpolate(
+                pixel_values, size=(vit_h, vit_w), mode="bicubic", align_corners=False
+            )
+        return pixel_values
+
+    def _resize_to_recon3d_vit(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Resize an already-VAE-resized multi-view image with ``ImageTransform(448, 224, 14)``.
+
+        Upstream ``reconstruct_3d`` pairs ``recon3d_vae_transform`` with
+        ``recon3d_vit_transform``; the patch grid shrinks from the default
+        ``ImageTransform(980, 224, 14)`` chain accordingly (e.g. 336x448 for
+        the 384x512 recon3d VAE grid).
+        """
+        h, w = pixel_values.shape[2], pixel_values.shape[3]
+        vit_h, vit_w = _sensenova_vit_resize_dims(h, w, max_size=SENSENOVA_RECON3D_VIT_MAX_SIZE)
         if vit_h != h or vit_w != w:
             pixel_values = torch.nn.functional.interpolate(
                 pixel_values, size=(vit_h, vit_w), mode="bicubic", align_corners=False
@@ -341,9 +442,25 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         if self._ropes_pending:
             self._ropes_pending.clear()
 
-        # Upstream runs the ViT transform on the VAE-transformed image.
-        vae_resized = [self._resize_to_stride(pv[None]) for pv in pixel_values]
-        vit_embeddings_tuple = self._vit_embeddings([self._resize_for_vit(pv)[0] for pv in vae_resized])
+        # Upstream runs the ViT transform on the VAE-transformed image.  A
+        # request conditioning on more than one img2img image (multi-view
+        # recon3d) swaps in the upstream per-task recon3d transforms for every
+        # view -- ``recon3d_vae_transform`` (``ImageTransform(512, 256, 16)``)
+        # for the VAE stage and ``recon3d_vit_transform``
+        # (``ImageTransform(448, 224, 14)``) for the ViT stage -- exactly like
+        # upstream ``reconstruct_3d``.  The resized (h_px, w_px) then flows
+        # through ``_register_img2img_info`` into ``kv_metadata["image_shape"]``,
+        # so the DiT decodes at the same recon3d VAE grid.
+        # ``get_img2img_replacement`` applies the same gate so placeholder
+        # token counts keep matching these embeds.
+        if num_images > 1:
+            vae_resize = self._resize_to_recon3d_vae
+            vit_resize = self._resize_to_recon3d_vit
+        else:
+            vae_resize = self._resize_to_stride
+            vit_resize = self._resize_for_vit
+        vae_resized = [vae_resize(pv[None]) for pv in pixel_values]
+        vit_embeddings_tuple = self._vit_embeddings([vit_resize(pv)[0] for pv in vae_resized])
 
         marker_ids = torch.tensor(
             [self._start_of_image_id, self._end_of_image_id],
