@@ -427,12 +427,16 @@ class SenseNovaVisionPipeline(BagelPipeline):
         """Multi-view ``recon3d`` decode: one AR context, N output views.
 
         Mirrors the upstream ``gen_image`` packing (``gen_image`` in
-        ``SenseNova-Vision/inference/inferencer.py``): the first view
-        continues from the injected AR KV cache while further views start
-        from an empty 0-length KV prefix, all sharing one VAE target shape
-        and one flow-matching decode loop.  ``generate_image`` splits its
-        denoised ``x_t`` by ``packed_seqlens - 2`` into ``num_views`` latent
-        branches, which this override decodes individually.
+        ``SenseNova-Vision/inference/inferencer.py``): ``prepare_vae_latent``
+        is fed one entry per view (``curr_kvlens = [kv_len] + [0]*(N-1)``,
+        ``curr_rope = base + 0..N-1``) so the packed indexes / RoPE / position
+        ids are built per view, and the per-view ``packed_seqlens`` are then
+        **collapsed into a single packed query sequence** (upstream
+        ``inferencer.py:164-166``).  All N views therefore co-attend, within
+        one non-causal sequence per CFG branch, to the full AR KV cache *and*
+        to each other.  The denoised latents are finally re-split by the saved
+        per-view ``packed_seqlens - 2`` into ``num_views`` chunks, which this
+        override decodes individually.
 
         Fidelity note: unless the request opts into
         ``output_type="raw_tensor"`` the views are 8-bit PIL images
@@ -487,11 +491,15 @@ class SenseNovaVisionPipeline(BagelPipeline):
         ropes = kv_metadata.get("ropes") or [kv_len]
         base_rope = int(ropes[0])
         kv_lens, view_ropes = recon3d_packing(num_views, kv_len, base_rope)
-        # ``PackedAttentionMoT._forward_gen`` splits the injected cache by
-        # ``key_values_lens`` into one slice per view branch: branch 0 owns the
-        # full AR context, the rest start empty (0 rows).
-        gen_cache.key_values_lens = kv_lens
+        # Every view attends to the whole AR context, so the gen cache is ONE
+        # packed sequence (a single ``key_values_lens`` entry) rather than one
+        # slice per view: ``PackedAttentionMoT._forward_gen`` then splits the
+        # merged cache once per CFG branch, and each branch's query sequence —
+        # all N views — sees the full AR KV.  Upstream collapses
+        # ``key_values_lens`` the same way (``inferencer.py:164-166``).
+        gen_cache.key_values_lens = [kv_len]
 
+        # The per-view entries build the packed indexes / RoPE / position ids.
         generation_input = self.bagel.prepare_vae_latent(
             curr_kvlens=kv_lens,
             curr_rope=view_ropes,
@@ -501,6 +509,17 @@ class SenseNovaVisionPipeline(BagelPipeline):
         for k, v in generation_input.items():
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
+
+        # Collapse the N per-view sequences into ONE packed query sequence
+        # (upstream ``inferencer.py:164-166``): the views co-attend inside a
+        # single non-causal sequence per CFG branch, instead of N independent
+        # branches where only view 0 owns the AR cache and the rest denoise
+        # from pure noise.  The pre-collapse ``packed_seqlens`` is kept as the
+        # unpack lengths, since the denoised ``x_t`` still holds one
+        # contiguous chunk of ``h*w`` latent tokens per view (upstream keeps
+        # the same variable to split ``x_0`` at ``inferencer.py:225``).
+        unpack_seqlens = generation_input["packed_seqlens"]
+        generation_input["packed_seqlens"] = torch.sum(unpack_seqlens, dim=0, keepdim=True, dtype=unpack_seqlens.dtype)
 
         gen_params = BagelGenParams(
             num_timesteps=int(params.num_inference_steps or 50),
@@ -521,8 +540,10 @@ class SenseNovaVisionPipeline(BagelPipeline):
         # position-ids and KV caches back into the BAGEL core, otherwise the
         # sequential-CFG/SP path dereferences a None branch pid.
         #
-        # Each CFG branch shares the same multi-view latent layout as the gen
-        # branch: ``kv_lens_cfg + [0]*(num_views-1)``, ``rope + 0..num_views-1``.
+        # Each CFG branch shares the same multi-view layout as the gen branch:
+        # ``prepare_vae_latent_cfg`` still receives per-view inputs
+        # (``kv_lens_cfg + [0]*(num_views-1)``, ``rope + 0..num_views-1``) while
+        # the branch cache itself is the single collapsed AR sequence.
         use_cfg_text = gen_params.cfg_text_scale > 1.0
         use_cfg_img = use_cfg_text and gen_params.cfg_img_scale > 1.0
 
@@ -548,15 +569,13 @@ class SenseNovaVisionPipeline(BagelPipeline):
             seq_len = cache.key_cache[0].shape[0]
             metadata = getattr(params, metadata_attr, None) or {}
             rope = int((metadata.get("ropes") or [seq_len])[0])
-            # The CFG branch cache feeds the same multi-view packed forward as
-            # the gen branch: ``_forward_gen`` splits the merged cache once per
-            # packed sequence (``batched_seqlens`` = ``packed_seqlens`` repeated
-            # ``num_branches`` times, i.e. ``num_views * num_branches`` entries),
-            # so each branch cache must expose the same per-view split
-            # (``[seq_len, 0, ..., 0]``) as the gen cache, otherwise the merge
-            # produces the wrong number of ``key_values_lens`` entries and
-            # ``split_with_zeros`` indexing goes out of range.
-            cache.key_values_lens = [seq_len] + [0] * (num_views - 1)
+            # Every CFG branch carries one packed sequence holding all views,
+            # so its cache is a single entry — the same collapsed shape as the
+            # gen cache.  ``_forward_gen`` splits the merged cache by these
+            # lengths (``batched_seqlens`` = the collapsed ``packed_seqlens``
+            # repeated once per CFG branch), so the merged list must hold
+            # exactly one entry per branch.
+            cache.key_values_lens = [seq_len]
             return {"kv_lens": [seq_len], "ropes": [rope], "past_key_values": cache}
 
         # cfg_text branch: unconditional text.  Upstream clones gen_context
@@ -611,17 +630,25 @@ class SenseNovaVisionPipeline(BagelPipeline):
                 return_trajectory_latents=False,
                 scheduler=self.scheduler,
                 scheduler_kwargs=self.scheduler_kwargs,
+                unpack_seqlens=unpack_seqlens,
                 **generation_input,
                 **cfg_branch_inputs,
                 **cfg_branch_caches,
             )
 
-        # Per-view decode: each view branch is a ``(h*w, latent_channel*patch^2)``
-        # latent reshaped to the shared image_shape and passed to the VAE
-        # decoder.  ``_decode_image_from_latent`` returns raw float32 tensors
-        # when the request opts into ``output_type="raw_tensor"``, else the
-        # standard 8-bit PIL image (see method docstring).
-        images = [self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape, params) for lat in latents]
+        # Per-view decode: ``generate_image`` unpacked the denoised ``x_t`` by
+        # ``unpack_seqlens - 2`` (= ``h*w`` per view, upstream
+        # ``inferencer.py:225``), so each entry is one view's
+        # ``(h*w, latent_channel*patch^2)`` latent reshaped to the shared
+        # ``image_shape`` and passed to the VAE decoder.
+        # ``_decode_image_from_latent`` returns raw float32 tensors when the
+        # request opts into ``output_type="raw_tensor"``, else the standard
+        # 8-bit PIL image (see method docstring).
+        images = [
+            self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape, params)
+            for lat in latents
+            if lat is not None
+        ]
         return build_sensenova_vision_diffusion_output(
             image=images,
             stage_durations=getattr(self, "stage_durations", None),
@@ -675,7 +702,7 @@ class SenseNovaVisionPipeline(BagelPipeline):
         ``output_type="raw_tensor"`` receives the raw HxWx3 float32 array.
         """
         if self._should_return_raw_tensor(params):
-            logger.info(f"[SenseNova-Vision] return raw tensor: {params=}")
+            # logger.info(f"[SenseNova-Vision] return raw tensor: {params=}")
             return self._decode_latent_raw(bagel, vae, latent, image_shape)
         return super()._decode_image_from_latent(bagel, vae, latent, image_shape)
 

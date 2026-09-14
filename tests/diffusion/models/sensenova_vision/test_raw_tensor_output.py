@@ -158,9 +158,14 @@ def test_forward_recon3d_raw_tensor_list() -> None:
         return np.asarray(reshaped[0].permute(1, 2, 0).float().cpu().numpy())
 
     pipeline._decode_image_from_latent = raw_decode
-    pipeline.bagel.prepare_vae_latent = lambda **kw: {"packed_seqlens": [0], "image_sizes": kw.get("image_sizes", [])}
+    # Per-view packed_seqlens (h*w + 2 each); ``_forward_recon3d`` collapses the
+    # sum for the denoise loop and passes the per-view values as unpack_seqlens.
+    pipeline.bagel.prepare_vae_latent = lambda **kw: {
+        "packed_seqlens": torch.tensor([16 + 2] * len(kw.get("image_sizes", [])), dtype=torch.int),
+        "image_sizes": kw.get("image_sizes", []),
+    }
     pipeline.bagel.generate_image = lambda **kw: (
-        [torch.full((16, 3 * 2 * 2), 0.25, dtype=torch.float32)] * len(kw.get("image_sizes", [])),
+        [torch.full((16, 3 * 2 * 2), 0.25, dtype=torch.float32) for _ in kw["unpack_seqlens"].tolist()],
         None,
         None,
         None,
@@ -184,9 +189,12 @@ def test_forward_recon3d_default_keeps_pil() -> None:
         return Image.new("RGB", (4, 4))
 
     pipeline._decode_image_from_latent = pil_decode
-    pipeline.bagel.prepare_vae_latent = lambda **kw: {"packed_seqlens": [0], "image_sizes": kw.get("image_sizes", [])}
+    pipeline.bagel.prepare_vae_latent = lambda **kw: {
+        "packed_seqlens": torch.tensor([16 + 2] * len(kw.get("image_sizes", [])), dtype=torch.int),
+        "image_sizes": kw.get("image_sizes", []),
+    }
     pipeline.bagel.generate_image = lambda **kw: (
-        [torch.full((16, 3 * 2 * 2), 0.25, dtype=torch.float32)] * len(kw.get("image_sizes", [])),
+        [torch.full((16, 3 * 2 * 2), 0.25, dtype=torch.float32) for _ in kw["unpack_seqlens"].tolist()],
         None,
         None,
         None,
@@ -195,6 +203,7 @@ def test_forward_recon3d_default_keeps_pil() -> None:
     out = pipeline._forward_recon3d(_request(output_type=None, num_views=2))
     payload = out.output["payload"]
     assert isinstance(payload["image"], list)
+    assert len(payload["image"]) == 2
     assert all(isinstance(img, Image.Image) for img in payload["image"])
 
 

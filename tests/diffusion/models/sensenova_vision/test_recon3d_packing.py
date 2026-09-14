@@ -10,9 +10,15 @@ from upstream ``inference/inferencer.py::gen_image``:
     curr_rope   = [rope0 + x for x in range(num_views)]
     image_sizes = [image_shape] * num_views
 
-and the per-task transform table distinguishes the VAE and ViT target sides
+The per-view entries only build the packed indexes / RoPE / position ids: the
+resulting ``packed_seqlens`` and the gen cache's ``key_values_lens`` are then
+**collapsed into a single packed sequence** (upstream ``inferencer.py:164-166``),
+so all views co-attend to the full AR KV cache and to each other inside one
+non-causal sequence per CFG branch.
+
+The per-task transform table distinguishes the VAE and ViT target sides
 (e.g. recon3d -> VAE 512 / ViT 448; camera-pose -> ViT 560).  Everything here is
-pure Python + PIL (no torch, no GPU, no checkpoint download).
+pure Python + PIL plus tensor stubs (no GPU, no checkpoint download).
 """
 
 from __future__ import annotations
@@ -124,41 +130,37 @@ def _make_naive_cache(seq_len: int) -> NaiveCache:
     return cache
 
 
-def test_naive_cache_merge_cfg_multi_view_invariant() -> None:
-    """Merged CFG caches expose num_views * num_branches per-sequence lengths.
+def test_naive_cache_merge_cfg_single_sequence_per_branch() -> None:
+    """Merged CFG caches expose exactly one (collapsed) sequence per branch.
 
-    Regression for the ``IndexError: list index out of range`` in
-    ``PackedAttentionMoT._forward_gen`` (bagel_transformer.py:640): in the
-    sequential-CFG path ``Bagel.forward`` builds ``batched_seqlens`` by
-    repeating the per-view ``packed_seqlens`` once per CFG branch, so
-    ``_forward_gen`` iterates ``num_views * num_branches`` packed sequences.
-    Each branch cache must therefore carry the same multi-view split
-    (``[rows, 0, ..., 0]``) as the gen cache; if a branch cache instead has
-    ``key_values_lens=None`` (transferred companion), ``NaiveCache.merge``
-    falls back to a single ``seq_lens`` entry and the merged list length is
-    too short, so ``split_with_zeros`` indexing goes out of range.
+    Regression for the per-view KV split that made recon3d point maps
+    meaningless: ``_forward_recon3d`` used to hand ``_forward_gen`` a
+    ``key_values_lens`` of ``[kv_len, 0, ..., 0]`` per branch, so only view 0
+    owned the AR context and the remaining views denoised from pure noise.
+    The collapsed upstream topology (``inferencer.py:164-166``) keeps one
+    packed sequence per CFG branch — the sequence that holds *all* views —
+    so each branch cache contributes a single ``seq_len`` entry and
+    ``Bagel.forward``'s ``batched_seqlens = packed_seqlens.repeat(num_branches)``
+    stays index-aligned with the merged cache split.
     """
-    num_views = 4
     gen = _make_naive_cache(100)
-    gen.key_values_lens = [100, 0, 0, 0]  # multi-view split (4 views)
+    gen.key_values_lens = [100]  # collapsed: all views in one sequence
     cfg_text = _make_naive_cache(200)
-    cfg_text.key_values_lens = [200, 0, 0, 0]
+    cfg_text.key_values_lens = [200]
     cfg_img = _make_naive_cache(300)
-    cfg_img.key_values_lens = [300, 0, 0, 0]
+    cfg_img.key_values_lens = [300]
 
     merged = NaiveCache.merge([gen, cfg_text, cfg_img])
-    # 3 CFG branches x 4 views = 12 per-sequence entries (matches
-    # batched_seqlens = packed_seqlens.repeat(3)).
-    assert merged.key_values_lens == [100, 0, 0, 0, 200, 0, 0, 0, 300, 0, 0, 0]
-    assert len(merged.key_values_lens) == 3 * num_views
+    # One entry per CFG branch (matches batched_seqlens = packed_seqlens.repeat(3)).
+    assert merged.key_values_lens == [100, 200, 300]
     # Rows are concatenated in the same branch order.
     assert merged.key_cache[0].shape[0] == 100 + 200 + 300
     # split_with_zeros must produce exactly len(merged.key_values_lens) slices.
     slices = NaiveCache.split_with_zeros(merged.key_cache[0], merged.key_values_lens)
-    assert len(slices) == 3 * num_views
+    assert len(slices) == 3
     assert slices[0].shape[0] == 100
-    assert slices[4].shape[0] == 200  # first slice of the cfg_text branch
-    assert slices[8].shape[0] == 300  # first slice of the cfg_img branch
+    assert slices[1].shape[0] == 200  # cfg_text branch
+    assert slices[2].shape[0] == 300  # cfg_img branch
 
 
 def _cache(seq_len: int) -> SimpleNamespace:
@@ -205,23 +207,44 @@ def _recon3d_request_from_prompt(*, num_markers: int, num_views: int | None = No
     return DiffusionRequestBatch(requests=[req])
 
 
+def _fake_prepare_vae_latent(**kw: Any) -> dict[str, Any]:
+    """``prepare_vae_latent`` stub returning *per-view* ``packed_seqlens``.
+
+    Mirrors ``Bagel.prepare_input``: one ``h*w + 2`` entry per view, where
+    ``h*w`` is the latent token count for the requested ``image_shape``.  The
+    pipeline collapses this to a single summed entry before denoising and
+    re-splits the denoised latents with the saved per-view values, so the stub
+    must stay per-view and tensor-typed.
+    """
+    image_sizes = kw.get("image_sizes", [])
+    downsample = 8
+    per_view = [(h // downsample) * (w // downsample) + 2 for h, w in image_sizes]
+    return {
+        "packed_seqlens": torch.tensor(per_view, dtype=torch.int),
+        "packed_init_noises": torch.zeros(sum(s - 2 for s in per_view), 1),
+        "image_sizes": image_sizes,
+    }
+
+
+def _fake_generate_image(**kw: Any) -> tuple[list[Any], None, None, None]:
+    """``generate_image`` stub unpacking ``x_t`` by the unpack lengths.
+
+    Mirrors the real tail of ``Bagel.generate_image``: the denoised ``x_t``
+    (whose token count matches the collapsed ``packed_seqlens``) is split by
+    ``unpack_seqlens - 2``, i.e. one chunk of ``h*w`` latent tokens per view.
+    """
+    unpack_seqlens = kw["unpack_seqlens"]
+    return [torch.zeros(max(s - 2, 0), 1) for s in unpack_seqlens.tolist()], None, None, None
+
+
 def _recon3d_pipeline() -> SenseNovaVisionPipeline:
     """Build a SenseNovaVisionPipeline instance without loading weights."""
     pipeline = object.__new__(SenseNovaVisionPipeline)
     pipeline.bagel = SimpleNamespace(
         latent_downsample=8,
         max_latent_size=64,
-        prepare_vae_latent=lambda **kw: {
-            "packed_seqlens": [0],
-            "packed_init_noises": torch.zeros(1, 1),
-            "image_sizes": kw.get("image_sizes", []),
-        },
-        generate_image=lambda **kw: (
-            [torch.zeros(1, 1)] * len(kw.get("image_sizes", [])),
-            None,
-            None,
-            None,
-        ),
+        prepare_vae_latent=_fake_prepare_vae_latent,
+        generate_image=_fake_generate_image,
     )
     pipeline.new_token_ids = {}
     pipeline.device = torch.device("cpu")
@@ -308,12 +331,12 @@ def test_forward_recon3d_cfg_feeds_branch_inputs() -> None:
     """
     captured: dict[str, Any] = {}
 
-    def _fake_generate_image(**kw: Any) -> tuple[list[Any], None, None, None]:
+    def _capture_generate_image(**kw: Any) -> tuple[list[Any], None, None, None]:
         captured.update(kw)
-        return [torch.zeros(1, 1)] * len(kw.get("image_sizes", [])), None, None, None
+        return _fake_generate_image(**kw)
 
     pipeline = _recon3d_pipeline()
-    pipeline.bagel.generate_image = _fake_generate_image
+    pipeline.bagel.generate_image = _capture_generate_image
 
     def _fake_cfg_pids(**kw: Any) -> dict[str, torch.Tensor]:
         # Mirrors prepare_vae_latent_cfg: per view, (h*w + 2) ids at the view rope.
@@ -340,21 +363,68 @@ def test_forward_recon3d_cfg_feeds_branch_inputs() -> None:
     assert captured.get("cfg_text_past_key_values") is not None
     # num_views=3 => branch pids length = 3 * (h*w + 2); h*w = (16//8)^2 = 4.
     assert captured["cfg_text_packed_position_ids"].numel() == 3 * 6
-    assert captured.get("cfg_text_past_key_values") is not None
     assert "cfg_img_packed_position_ids" not in captured  # img CFG disabled
-    # ``Bagel.forward`` merges the CFG caches into a single packed forward;
-    # ``PackedAttentionMoT._forward_gen`` splits the merged cache once per
-    # packed sequence.  ``batched_seqlens`` repeats the per-view ``packed_seqlens``
-    # once per CFG branch, so the merged ``key_values_lens`` must have exactly
-    # ``num_views * num_branches`` entries: each branch cache carries the same
-    # multi-view split (``[kv_len, 0, 0]``) as the gen cache.
+    # Every branch — gen and each CFG companion — is ONE packed sequence
+    # holding all views, and each attends to the full AR KV (no per-view
+    # split left behind for any cache), matching upstream inferencer.py:164-166.
     gen_cache = captured["past_key_values"]
-    assert gen_cache.key_values_lens == [16, 0, 0]  # multi-view split intact
+    assert gen_cache.key_values_lens == [16]  # collapsed: one sequence, full AR context
     cfg_text_cache = captured["cfg_text_past_key_values"]
     assert cfg_text_cache is not gen_cache
-    # Each CFG branch cache repeats the gen multi-view split.
-    assert cfg_text_cache.key_values_lens == [16, 0, 0]
+    assert cfg_text_cache.key_values_lens == [16]
     merged = NaiveCache.merge([gen_cache, cfg_text_cache])
-    # 2 CFG branches x 3 views = 6 per-sequence entries.
-    assert merged.key_values_lens == [16, 0, 0, 16, 0, 0]
-    assert len(merged.key_values_lens) == 2 * 3
+    # 2 CFG branches -> 2 per-sequence entries (matches
+    # batched_seqlens = packed_seqlens.repeat(2)).
+    assert merged.key_values_lens == [16, 16]
+    assert len(merged.key_values_lens) == 2
+
+
+def test_forward_recon3d_collapses_to_single_packed_sequence() -> None:
+    """The N views are collapsed into ONE packed query sequence per branch.
+
+    Regression for the garbage recon3d point maps: with the old per-view
+    topology only view 0 attended to the AR context (its cache slice was the
+    whole cache; the rest got 0-length slices) and no view ever attended to
+    the others, so views 1..N-1 decoded from pure noise.  Upstream instead
+    builds the per-view entries only for the packed indexes / RoPE / position
+    ids and then sums them (``inferencer.py:164-166``), giving a single
+    non-causal sequence in which every view sees the full AR KV *and* its
+    sibling views.
+    """
+    captured: dict[str, Any] = {}
+    prepare_calls: list[dict[str, Any]] = []
+
+    def _capture_prepare_vae_latent(**kw: Any) -> dict[str, Any]:
+        prepare_calls.append(kw)
+        return _fake_prepare_vae_latent(**kw)
+
+    def _capture_generate_image(**kw: Any) -> tuple[list[Any], None, None, None]:
+        captured.update(kw)
+        return _fake_generate_image(**kw)
+
+    pipeline = _recon3d_pipeline()
+    pipeline.bagel.prepare_vae_latent = _capture_prepare_vae_latent
+    pipeline.bagel.generate_image = _capture_generate_image
+
+    out = pipeline._forward_recon3d(_recon3d_request(num_views=3))
+
+    # prepare_vae_latent still receives the per-view entries (they build the
+    # packed indexes / RoPE / position ids).
+    [prepare_kw] = prepare_calls
+    assert prepare_kw["curr_kvlens"] == [16, 0, 0]
+    assert prepare_kw["curr_rope"] == [16, 17, 18]
+    assert len(prepare_kw["image_sizes"]) == 3
+
+    # ... but the denoise loop gets ONE packed sequence: all 3 views, h*w + 2
+    # tokens each (h*w = 4 for a 16x16 shape at downsample 8) => 18.
+    packed_seqlens = captured["packed_seqlens"]
+    assert packed_seqlens.numel() == 1
+    assert int(packed_seqlens.sum()) == 3 * 6
+    # The gen cache exposes the same collapsed shape, so ``_forward_gen``
+    # splits the merged cache once per CFG branch and every view sees the
+    # full AR KV.
+    assert captured["past_key_values"].key_values_lens == [16]
+    # The final unpack still uses the per-view lengths (upstream keeps the
+    # pre-collapse variable for ``x_0.split`` at inferencer.py:225).
+    assert captured["unpack_seqlens"].tolist() == [6, 6, 6]
+    assert len(out.output["payload"]["image"]) == 3
