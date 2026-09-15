@@ -114,3 +114,20 @@ SENSENOVA_VISION_THINK_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+SENSENOVA_VISION_SINGLE_STAGE_PIPELINE = PipelineConfig(
+    model_type="sensenova_vision_single_stage",
+    default_deploy_config_name="sensenova_vision_single_stage.yaml",
+    model_arch="SenseNovaVisionForConditionalGeneration",
+    hf_architectures=(),
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="dit",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(),
+            final_output=True,
+            final_output_type="image",
+        ),
+    ),
+)

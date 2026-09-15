@@ -264,6 +264,22 @@ def test_is_recon3d_selects_mode() -> None:
     assert pipeline._is_recon3d(_recon3d_request(mode="generate")) is False
 
 
+def test_single_stage_context_resize_uses_sensenova_transforms() -> None:
+    """Local prefill uses the model-executor VAE then ViT resize chains."""
+    pipeline = object.__new__(SenseNovaVisionPipeline)
+    image = Image.new("RGB", (1600, 800))
+
+    default_vae = pipeline._resize_context_image(image, num_images=1)
+    default_vit = pipeline._context_vit_transform(default_vae, num_images=1)
+    assert default_vae.size == (1024, 512)
+    assert tuple(default_vit.shape) == (3, 490, 980)
+
+    recon_vae = pipeline._resize_context_image(image, num_images=2)
+    recon_vit = pipeline._context_vit_transform(recon_vae, num_images=2)
+    assert recon_vae.size == (512, 256)
+    assert tuple(recon_vit.shape) == (3, 224, 448)
+
+
 def test_forward_recon3d_decodes_num_views_images() -> None:
     """``_forward_recon3d`` decodes one PIL image per view and packs them as a list."""
     pipeline = _recon3d_pipeline()
@@ -272,6 +288,35 @@ def test_forward_recon3d_decodes_num_views_images() -> None:
     assert isinstance(payload["image"], list)
     assert len(payload["image"]) == 3
     assert all(isinstance(img, Image.Image) for img in payload["image"])
+
+
+def test_forward_recon3d_single_stage_prefills_locally(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No-KV recon3d reuses locally-prefilled CFG contexts and emits every view."""
+    pipeline = _recon3d_pipeline()
+    contexts = []
+    for _ in range(3):
+        cache = _make_naive_cache(16)
+        contexts.append({"kv_lens": [16], "ropes": [16], "past_key_values": cache})
+
+    monkeypatch.setattr(
+        pipeline,
+        "_prepare_single_stage_contexts",
+        lambda first_prompt, sampling: (contexts[0], contexts[1], contexts[2], (16, 16)),
+    )
+    params = OmniDiffusionSamplingParams(
+        num_inference_steps=2,
+        extra_args={"sensenova_vision_mode": "recon3d"},
+    )
+    prompt = {
+        "prompt": "<|image_pad|><|image_pad|>recon3d",
+        "modalities": ["img2img"],
+        "multi_modal_data": {"img2img": [Image.new("RGB", (16, 16)), Image.new("RGB", (16, 16))]},
+    }
+    req = OmniDiffusionRequest(prompt=prompt, request_id="req-single-stage-recon3d", sampling_params=params)
+
+    out = pipeline._forward_recon3d(DiffusionRequestBatch(requests=[req]))
+    assert len(out.output["payload"]["image"]) == 2
+    assert contexts[0]["past_key_values"].key_values_lens == [16]
 
 
 def test_count_conditioned_views_counts_fim_markers() -> None:

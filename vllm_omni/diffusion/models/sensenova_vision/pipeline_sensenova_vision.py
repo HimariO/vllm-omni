@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from copy import copy, deepcopy
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,7 @@ from vllm_omni.diffusion.models.sensenova_vision.tokenization_sensenova_vision i
 )
 from vllm_omni.diffusion.models.sensenova_vision.transforms_sensenova_vision import (
     PER_TASK_VAE_SIDE,
+    max_long_edge_resize,
     recon3d_packing,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -354,6 +356,151 @@ class SenseNovaVisionPipeline(BagelPipeline):
         if hasattr(bagel.latent_pos_embed, "max_num_patch_per_side"):
             bagel.latent_pos_embed.max_num_patch_per_side = self._sensenova_vision_max_latent_size
 
+    def _resize_context_image(self, image: PIL.Image.Image, *, num_images: int) -> PIL.Image.Image:
+        """Apply SenseNova's VAE transform in the single-stage prefill path.
+
+        The model-executor path uses the checkpoint default VAE transform for
+        one img2img input, but switches every view to recon3d's smaller VAE
+        transform when more than one image conditions the request.
+        """
+        if num_images > 1:
+            return max_long_edge_resize(512, 256, 16)(image)
+        return max_long_edge_resize(1024, 512, 16)(image)
+
+    def _context_vit_transform(self, image: PIL.Image.Image, *, num_images: int) -> torch.Tensor:
+        """Apply SenseNova's ViT-of-VAE transform for local context prefill."""
+        if num_images > 1:
+            image = max_long_edge_resize(448, 224, 14)(image)
+        else:
+            image = max_long_edge_resize(980, 224, 14)(image)
+        return torch.from_numpy(np.array(image.convert("RGB"))).float().permute(2, 0, 1) / 127.5 - 1.0
+
+    def _prepare_single_stage_contexts(
+        self,
+        first_prompt: Any,
+        sampling: OmniDiffusionSamplingParams,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], tuple[int, int]]:
+        """Locally prefill text/images using SenseNova's VAE->ViT transforms.
+
+        BAGEL's equivalent code is intentionally not changed: this is a
+        SenseNova-only single-stage prefill path.  It prepares the same three
+        contexts (positive, text-CFG, image-CFG) that the BAGEL denoiser
+        consumes, while using the resize policy shared with the AR executor.
+        """
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        data = {} if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {})
+        images = data.get("image") or data.get("img2img") or []
+        if not isinstance(images, list):
+            images = [images]
+        images = [PIL.Image.open(image) if isinstance(image, str) else image for image in images]
+
+        gen_context = {
+            "kv_lens": [0],
+            "ropes": [0],
+            "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
+        }
+        cfg_text_context = deepcopy(gen_context)
+        cfg_img_context = deepcopy(gen_context)
+        image_shape = (
+            int(self.bagel.max_latent_size * self.bagel.latent_downsample),
+            int(self.bagel.max_latent_size * self.bagel.latent_downsample),
+        )
+
+        def to_device(inputs: dict[str, Any]) -> dict[str, Any]:
+            return {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+
+        autocast = torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        )
+
+        def add_text(context: dict[str, Any], text: str) -> None:
+            text_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_prompts(
+                curr_kvlens=context["kv_lens"],
+                curr_rope=context["ropes"],
+                prompts=[text],
+                tokenizer=self.tokenizer,
+                new_token_ids=self.new_token_ids,
+            )
+            with autocast:
+                context["past_key_values"] = self.bagel.forward_cache_update_text(
+                    context["past_key_values"], **to_device(text_input)
+                )
+
+        def vae_transform(image: PIL.Image.Image) -> torch.Tensor:
+            return torch.from_numpy(np.array(image.convert("RGB"))).float().permute(2, 0, 1) / 127.5 - 1.0
+
+        def add_image(image: PIL.Image.Image) -> tuple[int, int]:
+            image = self._resize_context_image(image, num_images=len(images))
+            vae_input, gen_context["kv_lens"], gen_context["ropes"] = self.bagel.prepare_vae_images(
+                curr_kvlens=gen_context["kv_lens"],
+                curr_rope=gen_context["ropes"],
+                images=[image],
+                transforms=vae_transform,
+                new_token_ids=self.new_token_ids,
+            )
+            with autocast:
+                gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
+                    self.vae, gen_context["past_key_values"], **to_device(vae_input)
+                )
+            vit_input, gen_context["kv_lens"], gen_context["ropes"] = self.bagel.prepare_vit_images(
+                curr_kvlens=gen_context["kv_lens"],
+                curr_rope=gen_context["ropes"],
+                images=[image],
+                transforms=lambda img: self._context_vit_transform(img, num_images=len(images)),
+                new_token_ids=self.new_token_ids,
+            )
+            for key in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+                vit_input.pop(key, None)
+            with autocast:
+                gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
+                    gen_context["past_key_values"], **to_device(vit_input)
+                )
+            return image.size[::-1]
+
+        clean_prompt = prompt.removeprefix("<|im_start|>").removesuffix("<|im_end|>")
+        segments = clean_prompt.split("<|image_pad|>")
+        if len(segments) != len(images) + 1:
+            segments = [""] * len(images) + ["".join(segments)]
+        for index, text in enumerate(segments):
+            if text.strip():
+                cfg_text_context = deepcopy(gen_context)
+                add_text(gen_context, text)
+            if index < len(images):
+                image_shape = add_image(images[index])
+                cfg_text_context = deepcopy(gen_context)
+        negative_prompt = first_prompt.get("negative_prompt") if isinstance(first_prompt, dict) else None
+        if negative_prompt is None:
+            negative_prompt = (sampling.extra_args or {}).get("negative_prompt", "")
+        if negative_prompt:
+            add_text(cfg_text_context, negative_prompt)
+        for text in segments:
+            if text.strip():
+                add_text(cfg_img_context, text)
+        return gen_context, cfg_text_context, cfg_img_context, image_shape
+
+    def _forward_single(self, first_prompt: Any, sampling: OmniDiffusionSamplingParams, *, prepare_only: bool = False):
+        """Run image requests through SenseNova-only local context prefill."""
+        if sampling.past_key_values is not None:
+            return super()._forward_single(first_prompt, sampling, prepare_only=prepare_only)
+        modalities = first_prompt.get("modalities", []) if isinstance(first_prompt, dict) else []
+        if "text" in modalities:
+            # Text-only output follows BAGEL's native autoregressive path.
+            return super()._forward_single(first_prompt, sampling, prepare_only=prepare_only)
+
+        gen_context, cfg_text_context, cfg_img_context, image_shape = self._prepare_single_stage_contexts(
+            first_prompt, sampling
+        )
+        local_sampling = copy(sampling)
+        local_sampling.past_key_values = gen_context["past_key_values"]
+        local_sampling.kv_metadata = {"ropes": gen_context["ropes"], "image_shape": image_shape}
+        local_sampling.cfg_text_past_key_values = cfg_text_context["past_key_values"]
+        local_sampling.cfg_text_kv_metadata = {"ropes": cfg_text_context["ropes"]}
+        local_sampling.cfg_img_past_key_values = cfg_img_context["past_key_values"]
+        local_sampling.cfg_img_kv_metadata = {"ropes": cfg_img_context["ropes"]}
+        return super()._forward_single(first_prompt, local_sampling, prepare_only=prepare_only)
+
     def forward(self, req) -> DiffusionOutput:
         """Run SenseNovaVision image/text generation with per-mode defaults.
 
@@ -362,8 +509,9 @@ class SenseNovaVisionPipeline(BagelPipeline):
         ``packed_seqlens`` length-N, ``generate_image`` returns N unpacked
         latents).  SenseNovaVision only needs to branch the AR-supplied KV
         context across those ``N`` view branches and emit one image per
-        view.  ``recon3d`` is the first task to request this; all other modes
-        delegate to the BAGEL core unchanged.
+        view. ``recon3d`` is the first task to request this. For one-stage
+        image requests, local context prefill remains in this pipeline so its
+        VAE/ViT resize chain stays aligned with the model executor.
 
         The BAGEL core already decodes latents through the instance method
         :meth:`_decode_image_from_latent`: when the request opts into
@@ -423,6 +571,19 @@ class SenseNovaVisionPipeline(BagelPipeline):
             return 0
         return str(prompt.get("prompt", "")).count(IMG2IMG_PLACEHOLDER)
 
+    @staticmethod
+    def _count_single_stage_images(req: DiffusionRequestBatch) -> int:
+        """Return the locally supplied context-image count for a one-stage request."""
+        prompts = getattr(req, "prompts", None) or []
+        prompt = prompts[0] if prompts else None
+        if not isinstance(prompt, dict):
+            return 0
+        data = prompt.get("multi_modal_data") or {}
+        images = data.get("img2img") or data.get("image")
+        if images is None:
+            return 0
+        return len(images) if isinstance(images, list) else 1
+
     def _forward_recon3d(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Multi-view ``recon3d`` decode: one AR context, N output views.
 
@@ -459,6 +620,11 @@ class SenseNovaVisionPipeline(BagelPipeline):
         # override (e.g. end2end.py --num-views) and must cover every
         # conditioned view.
         num_conditioned_views = self._count_conditioned_views(req)
+        # A staged request carries one ``<|fim_middle|>`` per view.  The
+        # single-stage BAGEL-compatible prompt instead contains image-pad
+        # placeholders, so derive its count from the local multimodal payload.
+        if getattr(params, "past_key_values", None) is None:
+            num_conditioned_views = max(num_conditioned_views, self._count_single_stage_images(req))
         num_views = int(extra_args.get("num_views", max(num_conditioned_views, 1)))
         if num_views < 1:
             raise ValueError(f"recon3d requires num_views >= 1, got {num_views}.")
@@ -468,28 +634,37 @@ class SenseNovaVisionPipeline(BagelPipeline):
                 f"is {num_views}; the output view count must cover every conditioned view."
             )
 
-        # The multi-view decode continues from the AR KV context.  Without an
-        # injected cache there is no conditioning to branch from.
         injected_kv = getattr(params, "past_key_values", None)
         if injected_kv is None:
-            # TODO: add support for single stage pipeline later
-            raise ValueError("recon3d requires an injected KV cache (past_key_values).")
-        gen_cache = NaiveCache.from_object(injected_kv)
-        kv_len = gen_cache.key_cache[0].shape[0]
-
-        kv_metadata = getattr(params, "kv_metadata", None) or {}
-        if "image_shape" in kv_metadata:
-            image_shape = tuple(kv_metadata["image_shape"])
+            # Build the three local CFG contexts with SenseNova's VAE->ViT
+            # transforms, then feed them through the same collapsed multi-view
+            # denoising path as staged recon3d.
+            gen_cfg_context, cfg_text_context, cfg_img_context, image_shape = self._prepare_single_stage_contexts(
+                req.prompts[0], params
+            )
+            gen_cache = gen_cfg_context["past_key_values"]
+            kv_len = int(gen_cfg_context["kv_lens"][0])
+            base_rope = int(gen_cfg_context["ropes"][0])
+            for context in (gen_cfg_context, cfg_text_context, cfg_img_context):
+                context["past_key_values"].key_values_lens = [int(context["kv_lens"][0])]
         else:
-            # Per-task VAE target side (512 for recon3d), clamped to the
-            # checkpoint latent budget so the DiT grid stays in-bounds.
-            side = PER_TASK_VAE_SIDE.get("recon3d")
-            if side is None or side // self.bagel.latent_downsample > self.bagel.max_latent_size:
-                side = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
-            image_shape = (side, side)
+            gen_cache = NaiveCache.from_object(injected_kv)
+            kv_len = gen_cache.key_cache[0].shape[0]
 
-        ropes = kv_metadata.get("ropes") or [kv_len]
-        base_rope = int(ropes[0])
+            kv_metadata = getattr(params, "kv_metadata", None) or {}
+            if "image_shape" in kv_metadata:
+                image_shape = tuple(kv_metadata["image_shape"])
+            else:
+                # Per-task VAE target side (512 for recon3d), clamped to the
+                # checkpoint latent budget so the DiT grid stays in-bounds.
+                side = PER_TASK_VAE_SIDE.get("recon3d")
+                if side is None or side // self.bagel.latent_downsample > self.bagel.max_latent_size:
+                    side = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
+                image_shape = (side, side)
+
+            ropes = kv_metadata.get("ropes") or [kv_len]
+            base_rope = int(ropes[0])
+            gen_cfg_context = {"kv_lens": [kv_len], "ropes": [base_rope], "past_key_values": gen_cache}
         kv_lens, view_ropes = recon3d_packing(num_views, kv_len, base_rope)
         # Every view attends to the whole AR context, so the gen cache is ONE
         # packed sequence (a single ``key_values_lens`` entry) rather than one
@@ -547,10 +722,6 @@ class SenseNovaVisionPipeline(BagelPipeline):
         use_cfg_text = gen_params.cfg_text_scale > 1.0
         use_cfg_img = use_cfg_text and gen_params.cfg_img_scale > 1.0
 
-        # gen branch: also the branch that continues the AR context.  For
-        # recon3d the gen branch is the full context (all views + prompt).
-        gen_cfg_context = {"kv_lens": [kv_len], "ropes": [base_rope], "past_key_values": gen_cache}
-
         def _branch_context(
             kv_attr: str,
             metadata_attr: str,
@@ -582,14 +753,16 @@ class SenseNovaVisionPipeline(BagelPipeline):
         # right BEFORE the last prompt string is added (so it holds all views
         # but no prompt text); in the staged AR->DiT flow this is the
         # ``__cfg_text`` companion KV.
-        cfg_text_context = _branch_context("cfg_text_past_key_values", "cfg_text_kv_metadata", gen_cfg_context)
+        if injected_kv is not None:
+            cfg_text_context = _branch_context("cfg_text_past_key_values", "cfg_text_kv_metadata", gen_cfg_context)
 
         # cfg_img branch: same text as gen but WITHOUT image conditioning.  For
         # text2img the upstream / BAGEL paths reuse the gen KV here
         # (``pipeline_bagel.py:639-649``); recon3d has no separate no-image
         # preconditioned context either, so reuse the gen branch KV when the
         # ``__cfg_img`` companion was not transferred.
-        cfg_img_context = _branch_context("cfg_img_past_key_values", "cfg_img_kv_metadata", gen_cfg_context)
+        if injected_kv is not None:
+            cfg_img_context = _branch_context("cfg_img_past_key_values", "cfg_img_kv_metadata", gen_cfg_context)
 
         def _cfg_pids(context: dict[str, Any]) -> torch.Tensor:
             """Multi-view CFG branch position-ids (mirrors prepare_vae_latent_cfg)."""
