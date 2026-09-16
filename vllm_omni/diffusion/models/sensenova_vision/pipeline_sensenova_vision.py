@@ -380,19 +380,24 @@ class SenseNovaVisionPipeline(BagelPipeline):
         first_prompt: Any,
         sampling: OmniDiffusionSamplingParams,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], tuple[int, int]]:
-        """Locally prefill text/images using SenseNova's VAE->ViT transforms.
+        """Prefill a two-stage-compatible prompt using upstream local terms.
 
-        BAGEL's equivalent code is intentionally not changed: this is a
-        SenseNova-only single-stage prefill path.  It prepares the same three
-        contexts (positive, text-CFG, image-CFG) that the BAGEL denoiser
-        consumes, while using the resize policy shared with the AR executor.
+        Public prompts use vLLM's chat/placeholder transport scaffold.  The
+        upstream single-stage inferencer instead consumes an ordered sequence
+        of raw strings and images, then wraps every raw string in one
+        BOS/EOS pair.  Convert the transport scaffold at this boundary rather
+        than passing its role words and special tokens to the local cache.
+        ``image`` understanding inputs insert ViT tokens only, while
+        ``img2img`` generation inputs insert VAE then ViT tokens.
         """
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
         data = {} if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {})
-        images = data.get("image") or data.get("img2img") or []
+        understanding_image = data.get("image")
+        images = understanding_image if understanding_image is not None else (data.get("img2img") or [])
         if not isinstance(images, list):
             images = [images]
         images = [PIL.Image.open(image) if isinstance(image, str) else image for image in images]
+        image_marker = "<|image_pad|>" if understanding_image is not None else IMG2IMG_PLACEHOLDER
 
         gen_context = {
             "kv_lens": [0],
@@ -416,23 +421,29 @@ class SenseNovaVisionPipeline(BagelPipeline):
         )
 
         def add_text(context: dict[str, Any], text: str) -> None:
-            text_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_prompts(
-                curr_kvlens=context["kv_lens"],
-                curr_rope=context["ropes"],
-                prompts=[text],
-                tokenizer=self.tokenizer,
-                new_token_ids=self.new_token_ids,
-            )
-            with autocast:
-                context["past_key_values"] = self.bagel.forward_cache_update_text(
-                    context["past_key_values"], **to_device(text_input)
-                )
+            self._update_single_stage_text_context(context, text, autocast=autocast)
 
         def vae_transform(image: PIL.Image.Image) -> torch.Tensor:
             return torch.from_numpy(np.array(image.convert("RGB"))).float().permute(2, 0, 1) / 127.5 - 1.0
 
         def add_image(image: PIL.Image.Image) -> tuple[int, int]:
             image = self._resize_context_image(image, num_images=len(images))
+            if understanding_image is not None:
+                # The two-stage Thinker's img2text path uses the VAE resize as
+                # an image transform, but inserts only the ViT representation.
+                vit_input, gen_context["kv_lens"], gen_context["ropes"] = self.bagel.prepare_vit_images(
+                    curr_kvlens=gen_context["kv_lens"],
+                    curr_rope=gen_context["ropes"],
+                    images=[image],
+                    transforms=lambda img: self._context_vit_transform(img, num_images=len(images)),
+                    new_token_ids=self.new_token_ids,
+                )
+                with autocast:
+                    gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
+                        gen_context["past_key_values"], **to_device(vit_input)
+                    )
+                return image.size[::-1]
+
             vae_input, gen_context["kv_lens"], gen_context["ropes"] = self.bagel.prepare_vae_images(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
@@ -459,8 +470,7 @@ class SenseNovaVisionPipeline(BagelPipeline):
                 )
             return image.size[::-1]
 
-        clean_prompt = prompt.removeprefix("<|im_start|>").removesuffix("<|im_end|>")
-        segments = clean_prompt.split("<|image_pad|>")
+        segments = [self._single_stage_raw_text(segment) for segment in prompt.split(image_marker)]
         if len(segments) != len(images) + 1:
             segments = [""] * len(images) + ["".join(segments)]
         for index, text in enumerate(segments):
@@ -480,25 +490,169 @@ class SenseNovaVisionPipeline(BagelPipeline):
                 add_text(cfg_img_context, text)
         return gen_context, cfg_text_context, cfg_img_context, image_shape
 
+    @staticmethod
+    def _single_stage_raw_text(fragment: str) -> str:
+        """Recover one upstream raw text term from a formatter transport span.
+
+        The offline/online formatters emit either a standard user/assistant
+        wrapper or an image-generation wrapper.  These control markers are
+        meaningful to the two-stage vLLM executor, but upstream
+        ``InterleaveInferencer`` never receives them: it receives only the
+        stripped text around its ``<image>`` boundaries.
+        """
+        text = fragment.strip()
+        for prefix in ("<|im_start|>user", "<|im_start|>assistant", "<|im_start|>"):
+            if text.startswith(prefix):
+                text = text[len(prefix) :].lstrip()
+                break
+        for suffix in ("<|im_start|>assistant", "<|im_start|>", "<|im_end|>"):
+            if text.endswith(suffix):
+                text = text[: -len(suffix)].rstrip()
+        if text.endswith("<|im_end|>"):
+            text = text[: -len("<|im_end|>")].rstrip()
+        return text
+
+    def _update_single_stage_text_context(
+        self,
+        context: dict[str, Any],
+        text: str,
+        *,
+        autocast: Any | None = None,
+    ) -> None:
+        """Append one raw upstream text term, including its BOS/EOS wrapper."""
+        if not text.strip():
+            return
+        text_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_prompts(
+            curr_kvlens=context["kv_lens"],
+            curr_rope=context["ropes"],
+            prompts=[text.strip()],
+            tokenizer=self.tokenizer,
+            new_token_ids=self.new_token_ids,
+        )
+        to_device = {
+            key: value.to(self.device) if torch.is_tensor(value) else value for key, value in text_input.items()
+        }
+        if autocast is None:
+            with torch.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type != "cpu",
+                dtype=self.od_config.dtype,
+            ):
+                context["past_key_values"] = self.bagel.forward_cache_update_text(
+                    context["past_key_values"], **to_device
+                )
+        else:
+            with autocast:
+                context["past_key_values"] = self.bagel.forward_cache_update_text(
+                    context["past_key_values"], **to_device
+                )
+
+    def _decode_single_stage_text(
+        self,
+        gen_context: dict[str, Any],
+        sampling: OmniDiffusionSamplingParams,
+    ) -> str:
+        """Decode text from a SenseNova-local VAE+ViT-prefilled context.
+
+        ``BagelPipeline._forward_single`` only runs its native text decode when
+        ``sampling.past_key_values`` is absent.  A single-stage SenseNova image
+        request must provide that cache after local prefill, so keep the decode
+        here instead of making the BAGEL core mistake a local context for a
+        cross-stage KV handoff.
+        """
+        extra_args = getattr(sampling, "extra_args", None) or {}
+        max_tokens = int(extra_args.get("max_think_tokens", 500))
+        do_sample = bool(extra_args.get("do_sample", False))
+        temperature = float(extra_args.get("text_temperature", 0.3))
+
+        # Upstream ``gen_text`` operates on a deep copy.  Caption/think modes
+        # subsequently re-encode the decoded text into the original context;
+        # understanding modes only need the returned text.
+        decode_context = deepcopy(gen_context)
+        with torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        ):
+            start_input = self.bagel.prepare_start_tokens(
+                decode_context["kv_lens"], decode_context["ropes"], self.new_token_ids
+            )
+            for key, value in start_input.items():
+                if torch.is_tensor(value):
+                    start_input[key] = value.to(self.device)
+            logger.info("decdoe/generate_text start")
+            token_ids = self.bagel.generate_text(
+                past_key_values=decode_context["past_key_values"],
+                max_length=max_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                end_token_id=self.new_token_ids["eos_token_id"],
+                **start_input,
+            )
+
+        text = self.tokenizer.decode(token_ids[:, 0].tolist())
+        logger.info(f"gen text: {text}")
+        text = text.split("<|im_end|>")[0]
+        if "<|im_start|>" in text:
+            text = text.split("<|im_start|>")[-1]
+        return text
+
     def _forward_single(self, first_prompt: Any, sampling: OmniDiffusionSamplingParams, *, prepare_only: bool = False):
-        """Run image requests through SenseNova-only local context prefill."""
+        """Run single-stage requests with SenseNova's local VAE+ViT prefill."""
         if sampling.past_key_values is not None:
             return super()._forward_single(first_prompt, sampling, prepare_only=prepare_only)
         modalities = first_prompt.get("modalities", []) if isinstance(first_prompt, dict) else []
-        if "text" in modalities:
-            # Text-only output follows BAGEL's native autoregressive path.
-            return super()._forward_single(first_prompt, sampling, prepare_only=prepare_only)
 
         gen_context, cfg_text_context, cfg_img_context, image_shape = self._prepare_single_stage_contexts(
             first_prompt, sampling
         )
+
+        # Understanding must decode from the same SenseNova VAE+ViT context as
+        # the two-stage Thinker, rather than BAGEL's generic image prefill.
+        if "text" in modalities:
+            if prepare_only:
+                raise NotImplementedError("SenseNovaVision text output is not supported by step execution.")
+            text = self._decode_single_stage_text(gen_context, sampling)
+            return build_sensenova_vision_diffusion_output(text=text)
+
+        # Thinking image modes (notably caption_generate) need a complete AR
+        # caption before denoising.  The base BAGEL injected-KV path skips this
+        # decode by design because it assumes another stage already produced it.
+        extra_args = getattr(sampling, "extra_args", None) or {}
+        if extra_args.get("think"):
+            text = self._decode_single_stage_text(gen_context, sampling)
+            if text:
+                # Match upstream caption/think flow: generated tokens are
+                # decoded on a temporary cache, then the clean string is
+                # re-encoded into the original DiT conditioning context.
+                self._update_single_stage_text_context(gen_context, text)
+                # ``forward`` merges this into the image payload after the base
+                # denoiser returns.  Mutate the request-scoped params (as
+                # _apply_mode_defaults already does) so that merge sees it.
+                sampling.extra_args = dict(extra_args)
+                sampling.extra_args["text_output"] = text
+
         local_sampling = copy(sampling)
         local_sampling.past_key_values = gen_context["past_key_values"]
         local_sampling.kv_metadata = {"ropes": gen_context["ropes"], "image_shape": image_shape}
-        local_sampling.cfg_text_past_key_values = cfg_text_context["past_key_values"]
-        local_sampling.cfg_text_kv_metadata = {"ropes": cfg_text_context["ropes"]}
-        local_sampling.cfg_img_past_key_values = cfg_img_context["past_key_values"]
-        local_sampling.cfg_img_kv_metadata = {"ropes": cfg_img_context["ropes"]}
+
+        # BAGEL's injected-KV path expects every supplied companion cache to
+        # have a materialized first layer.  The text-unconditional branch is
+        # legitimately empty for text2img, and an image-free prompt can leave
+        # the image-CFG branch empty too; omit those instead so BAGEL retains
+        # its native empty/reuse fallback.
+        if cfg_text_context["past_key_values"].seq_lens:
+            local_sampling.cfg_text_past_key_values = cfg_text_context["past_key_values"]
+            local_sampling.cfg_text_kv_metadata = {"ropes": cfg_text_context["ropes"]}
+        else:
+            local_sampling.cfg_text_past_key_values = None
+            local_sampling.cfg_text_kv_metadata = None
+        if cfg_img_context["past_key_values"].seq_lens:
+            local_sampling.cfg_img_past_key_values = cfg_img_context["past_key_values"]
+            local_sampling.cfg_img_kv_metadata = {"ropes": cfg_img_context["ropes"]}
+        else:
+            local_sampling.cfg_img_past_key_values = None
+            local_sampling.cfg_img_kv_metadata = None
         return super()._forward_single(first_prompt, local_sampling, prepare_only=prepare_only)
 
     def forward(self, req) -> DiffusionOutput:

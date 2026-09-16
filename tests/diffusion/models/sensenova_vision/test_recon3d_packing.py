@@ -31,6 +31,7 @@ import torch
 from PIL import Image
 
 from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
+from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
 from vllm_omni.diffusion.models.sensenova_vision.pipeline_sensenova_vision import (
     SenseNovaVisionPipeline,
 )
@@ -317,6 +318,38 @@ def test_forward_recon3d_single_stage_prefills_locally(monkeypatch: pytest.Monke
     out = pipeline._forward_recon3d(DiffusionRequestBatch(requests=[req]))
     assert len(out.output["payload"]["image"]) == 2
     assert contexts[0]["past_key_values"].key_values_lens == [16]
+
+
+def test_single_stage_omits_empty_cfg_companion_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty text-CFG cache must use BAGEL's native injected-KV fallback."""
+    pipeline = _recon3d_pipeline()
+    gen_cache = _make_naive_cache(8)
+    empty_cache = NaiveCache(num_layers=1)
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        pipeline,
+        "_prepare_single_stage_contexts",
+        lambda first_prompt, sampling: (
+            {"kv_lens": [8], "ropes": [8], "past_key_values": gen_cache},
+            {"kv_lens": [0], "ropes": [0], "past_key_values": empty_cache},
+            {"kv_lens": [8], "ropes": [8], "past_key_values": gen_cache},
+            (16, 16),
+        ),
+    )
+
+    def capture_base_forward(self, first_prompt, sampling, *, prepare_only=False):
+        captured["sampling"] = sampling
+        return SimpleNamespace()
+
+    monkeypatch.setattr(BagelPipeline, "_forward_single", capture_base_forward)
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=2)
+    pipeline._forward_single({"prompt": "test", "modalities": ["image"]}, sampling)
+
+    local_sampling = captured["sampling"]
+    assert local_sampling.cfg_text_past_key_values is None
+    assert local_sampling.cfg_text_kv_metadata is None
+    assert local_sampling.cfg_img_past_key_values is gen_cache
 
 
 def test_count_conditioned_views_counts_fim_markers() -> None:
