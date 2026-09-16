@@ -1,7 +1,10 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # SenseNova-Vision online serving startup script
 
-MODEL="${MODEL:-sensenova/SenseNova-Vision-7B-MoT}"
+MODEL="${MODEL:-RzZ/SenseNova-Vision-7B-MoT}"
 PORT="${PORT:-8092}"
 DEPLOY_CONFIG="${DEPLOY_CONFIG:-vllm_omni/deploy/sensenova_vision.yaml}"
 

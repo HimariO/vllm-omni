@@ -13,7 +13,7 @@ from PIL import Image
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
-from vllm_omni.diffusion.models.sensenova_vision import pipeline_sensenova_vision as snv_pipeline
+from vllm_omni.diffusion.models.sensenova_vision import single_stage as snv_single_stage
 from vllm_omni.diffusion.models.sensenova_vision.pipeline_sensenova_vision import (
     SenseNovaVisionPipeline,
 )
@@ -126,7 +126,7 @@ def test_single_stage_prefill_normalizes_transport_markers_and_uses_vit_only_for
     )
     pipeline._resize_context_image = lambda image, **kwargs: image
     pipeline._context_vit_transform = lambda image, **kwargs: torch.zeros(3, 14, 14)
-    monkeypatch.setattr(snv_pipeline, "NaiveCache", FakeCache)
+    monkeypatch.setattr(snv_single_stage, "NaiveCache", FakeCache)
 
     prompt = "<|im_start|>user\n<|image_pad|>\nfind birds<|im_end|>\n<|im_start|>assistant\n"
     pipeline._prepare_single_stage_contexts(
