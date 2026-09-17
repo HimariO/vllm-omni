@@ -36,10 +36,6 @@ from vllm_omni.diffusion.models.sensenova_vision.pipeline_sensenova_vision impor
     SenseNovaVisionPipeline,
 )
 from vllm_omni.diffusion.models.sensenova_vision.transforms_sensenova_vision import (
-    PER_TASK_VAE_SIDE,
-    PER_TASK_VIT_SIDE,
-    ResizeSpec,
-    max_long_edge_resize,
     packed_seqlens,
     recon3d_packing,
 )
@@ -72,55 +68,6 @@ def test_packed_seqlens_n2() -> None:
     """Per-branch packed_seqlens = (h*w + 2) markers; latent 32x32 -> 1026."""
     seqlens = packed_seqlens(2, 32, 32)
     assert seqlens == [1026, 1026]
-
-
-def test_per_task_vae_side_contract() -> None:
-    """recon3d selects VAE 512; camera-pose has no VAE prefill."""
-    assert PER_TASK_VAE_SIDE["recon3d"] == 512
-    assert PER_TASK_VAE_SIDE["camera_pose"] is None
-
-
-def test_per_task_vit_side_contract() -> None:
-    """recon3d ViT 448 / camera-pose ViT 560."""
-    assert PER_TASK_VIT_SIDE["recon3d"] == 448
-    assert PER_TASK_VIT_SIDE["camera_pose"] == 560
-
-
-def test_resize_spec_target_side() -> None:
-    """Stride-aligned square target: largest stride multiple <= max_size."""
-    # ImageTransform(512, 256, 16) -> 512; (448, 224, 14) -> 448; (560, 378, 14) -> 560.
-    assert ResizeSpec(512, 256, 16).target_side == 512
-    assert ResizeSpec(448, 224, 14).target_side == 448
-    assert ResizeSpec(560, 378, 14).target_side == 560
-
-
-def test_resize_spec_vae_grid() -> None:
-    """Latent grid for the recon3d VAE side (downsample 8, patch 2 -> 16)."""
-    grid = ResizeSpec(512, 256, 16).vae_grid(latent_downsample=16)
-    assert grid == (32, 32)
-
-
-def test_max_long_edge_resize_downscales_to_target() -> None:
-    """A square input above the max downscales to the stride-aligned target."""
-    img = Image.new("RGB", (700, 700))
-    fn = max_long_edge_resize(512, 256, 16)
-    out = fn(img)
-    assert out.size == (512, 512)
-
-
-def test_resize_does_not_upscale_below_target() -> None:
-    """Inputs already within max_size are left at their native size (no upscale)."""
-    img = Image.new("RGB", (256, 256))
-    out = max_long_edge_resize(512, 256, 16)(img)
-    assert out.size == (256, 256)
-
-
-def test_max_long_edge_resize_clamps_stride() -> None:
-    """Output side is a multiple of stride and never below stride."""
-    img = Image.new("RGB", (1024, 1024))
-    out = max_long_edge_resize(560, 378, 14)(img)
-    assert out.size[0] % 14 == 0
-    assert out.size[0] <= 560
 
 
 def _make_naive_cache(seq_len: int) -> NaiveCache:

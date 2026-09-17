@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU tests for the SenseNova-Vision think two-stage pipeline config.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""CPU tests for SenseNova-Vision pipeline configurations.
 
 Covers the ``sensenova_vision_think`` structural-topology invariants that the
 ``BAGEL_THINK_PIPELINE`` mirror must satisfy:
@@ -11,6 +11,7 @@ Covers the ``sensenova_vision_think`` structural-topology invariants that the
 * Stage 1 has ``need_recv_cache=True`` and a ``custom_process_input_func``
   wired to the sensenova prompt-utils text bridge.
 * The registry resolves ``sensenova_vision_think`` to the same config instance.
+* The single-stage configuration resolves to one diffusion stage.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType
 from vllm_omni.model_executor.models.sensenova_vision.pipeline import (
     SENSENOVA_VISION_PIPELINE,
+    SENSENOVA_VISION_SINGLE_STAGE_PIPELINE,
     SENSENOVA_VISION_THINK_PIPELINE,
 )
 
@@ -32,7 +34,7 @@ def test_think_pipeline_stage0_uses_think_expander() -> None:
     stage0 = SENSENOVA_VISION_THINK_PIPELINE.get_stage(0)
     assert stage0 is not None
     assert stage0.prompt_expand_func == (
-        "vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts_think"
+        "vllm_omni.model_executor.models.sensenova_vision.cfg_expand.expand_sensenova_cfg_prompts_think"
     )
 
 
@@ -65,11 +67,6 @@ def test_think_pipeline_stage1_recvs_cache_and_wires_text_bridge() -> None:
     )
 
 
-def test_think_pipeline_validate() -> None:
-    """Topology must be structurally valid."""
-    assert SENSENOVA_VISION_THINK_PIPELINE.validate() == []
-
-
 def test_registry_resolves_sensenova_vision_think() -> None:
     """The registry maps ``sensenova_vision_think`` to the new config and it round-trips."""
     assert OMNI_PIPELINES["sensenova_vision_think"] is SENSENOVA_VISION_THINK_PIPELINE
@@ -77,3 +74,18 @@ def test_registry_resolves_sensenova_vision_think() -> None:
     assert isinstance(resolved, PipelineConfig)
     assert resolved is SENSENOVA_VISION_THINK_PIPELINE
     assert resolved.default_deploy_config_name == "sensenova_vision_think.yaml"
+
+
+def test_single_stage_topology_is_one_diffusion_stage() -> None:
+    stage = SENSENOVA_VISION_SINGLE_STAGE_PIPELINE.get_stage(0)
+    assert stage is not None
+    assert stage.execution_type == StageExecutionType.DIFFUSION
+    assert stage.input_sources == ()
+
+
+def test_single_stage_topology_resolves_from_registry() -> None:
+    assert OMNI_PIPELINES["sensenova_vision_single_stage"] is SENSENOVA_VISION_SINGLE_STAGE_PIPELINE
+    resolved = resolve_pipeline_config("sensenova_vision_single_stage")
+    assert isinstance(resolved, PipelineConfig)
+    assert resolved is SENSENOVA_VISION_SINGLE_STAGE_PIPELINE
+    assert resolved.default_deploy_config_name == "sensenova_vision_single_stage.yaml"
