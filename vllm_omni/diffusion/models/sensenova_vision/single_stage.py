@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-from copy import copy, deepcopy
-from typing import Any
+from copy import copy
+from typing import Any, TypedDict
 
 import numpy as np
 import PIL.Image
@@ -15,6 +15,23 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
 from vllm_omni.diffusion.models.sensenova_vision.transforms_sensenova_vision import max_long_edge_resize
 from vllm_omni.model_executor.models.sensenova_vision.cfg_expand import IMG2IMG_PLACEHOLDER
+
+
+class SingleStageGenerationContext(TypedDict):
+    """Mutable AR state owned by one SenseNova-Vision branch."""
+
+    kv_lens: list[int]
+    ropes: list[int]
+    past_key_values: NaiveCache
+
+
+def _clone_single_stage_context(context: SingleStageGenerationContext) -> SingleStageGenerationContext:
+    """Clone branch-owned containers without copying immutable cached KV tensors."""
+    return {
+        "kv_lens": list(context["kv_lens"]),
+        "ropes": list(context["ropes"]),
+        "past_key_values": context["past_key_values"].copy(),
+    }
 
 
 class SenseNovaVisionSingleStageMixin:
@@ -35,7 +52,7 @@ class SenseNovaVisionSingleStageMixin:
     def _single_stage_to_device(self, inputs: dict[str, Any]) -> dict[str, Any]:
         return {key: value.to(self.device) if torch.is_tensor(value) else value for key, value in inputs.items()}
 
-    def _new_single_stage_context(self) -> dict[str, Any]:
+    def _new_single_stage_context(self) -> SingleStageGenerationContext:
         return {
             "kv_lens": [0],
             "ropes": [0],
@@ -81,7 +98,7 @@ class SenseNovaVisionSingleStageMixin:
             terms = [""] * len(images) + ["".join(terms)]
         return terms, images, understanding_images is not None
 
-    def _update_single_stage_text_context(self, context: dict[str, Any], text: str) -> None:
+    def _update_single_stage_text_context(self, context: SingleStageGenerationContext, text: str) -> None:
         """Append one raw upstream text term, including its BAGEL BOS/EOS pair."""
         if not text.strip():
             return
@@ -99,7 +116,7 @@ class SenseNovaVisionSingleStageMixin:
 
     def _prefill_single_stage_image(
         self,
-        context: dict[str, Any],
+        context: SingleStageGenerationContext,
         image: PIL.Image.Image,
         *,
         num_images: int,
@@ -140,23 +157,28 @@ class SenseNovaVisionSingleStageMixin:
         self,
         first_prompt: Any,
         sampling: Any,
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], tuple[int, int]]:
+    ) -> tuple[
+        SingleStageGenerationContext,
+        SingleStageGenerationContext,
+        SingleStageGenerationContext,
+        tuple[int, int],
+    ]:
         """Build upstream-style positive, text-CFG, and image-CFG contexts."""
         terms, images, understanding = self._single_stage_terms(first_prompt)
         gen_context = self._new_single_stage_context()
-        cfg_text_context = deepcopy(gen_context)
-        cfg_img_context = deepcopy(gen_context)
+        cfg_text_context = _clone_single_stage_context(gen_context)
+        cfg_img_context = _clone_single_stage_context(gen_context)
         image_shape = (int(self.bagel.max_latent_size * self.bagel.latent_downsample),) * 2
 
         for index, text in enumerate(terms):
             if text:
-                cfg_text_context = deepcopy(gen_context)
+                cfg_text_context = _clone_single_stage_context(gen_context)
                 self._update_single_stage_text_context(gen_context, text)
             if index < len(images):
                 image_shape = self._prefill_single_stage_image(
                     gen_context, images[index], num_images=len(images), understanding=understanding
                 )
-                cfg_text_context = deepcopy(gen_context)
+                cfg_text_context = _clone_single_stage_context(gen_context)
 
         negative_prompt = first_prompt.get("negative_prompt") if isinstance(first_prompt, dict) else None
         if negative_prompt is None:
@@ -166,10 +188,10 @@ class SenseNovaVisionSingleStageMixin:
             self._update_single_stage_text_context(cfg_img_context, text)
         return gen_context, cfg_text_context, cfg_img_context, image_shape
 
-    def _decode_single_stage_text(self, gen_context: dict[str, Any], sampling: Any) -> str:
+    def _decode_single_stage_text(self, gen_context: SingleStageGenerationContext, sampling: Any) -> str:
         """Decode on a copied cache, exactly like upstream ``gen_text``."""
         extra_args = getattr(sampling, "extra_args", None) or {}
-        decode_context = deepcopy(gen_context)
+        decode_context = _clone_single_stage_context(gen_context)
         with self._single_stage_autocast():
             start_input = self.bagel.prepare_start_tokens(
                 decode_context["kv_lens"], decode_context["ropes"], self.new_token_ids

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the SenseNova-Vision end2end example formatters.
 
 Guards the #2/#3 divergence bug class permanently: every formatter's prompt
@@ -209,7 +209,7 @@ def _placeholders_bind_all_items(prompt: dict, tokenizer, info_ctx) -> None:
     for modality in ("image", "img2img"):
         if modality not in placeholders:
             continue
-        covered = set()
+        covered: set[int] = set()
         for ph in placeholders[modality]:
             covered.update(range(ph.start_idx, ph.start_idx + len(ph.tokens)))
         assert covered, f"{modality}: placeholder ranges must be non-empty"

@@ -32,6 +32,26 @@ def _contexts() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], tuple[i
     return context, dict(context), dict(context), (16, 16)
 
 
+def test_single_stage_context_clone_isolates_branch_owned_state() -> None:
+    class FakeCache:
+        def __init__(self, layers: list[int]) -> None:
+            self.layers = layers
+
+        def copy(self) -> FakeCache:
+            return FakeCache(list(self.layers))
+
+    context: dict[str, Any] = {"kv_lens": [8], "ropes": [12], "past_key_values": FakeCache([1])}
+    clone = snv_single_stage._clone_single_stage_context(context)
+    clone["kv_lens"].append(4)
+    clone["ropes"][0] = 99
+    clone["past_key_values"].layers.append(2)
+
+    assert context["kv_lens"] == [8]
+    assert context["ropes"] == [12]
+    assert clone["past_key_values"] is not context["past_key_values"]
+    assert context["past_key_values"].layers == [1]
+
+
 def test_single_stage_img2text_decodes_from_sensenova_local_context(monkeypatch: pytest.MonkeyPatch) -> None:
     """Text output does not fall back to BAGEL's generic image prefill."""
     pipeline = _pipeline()
@@ -99,6 +119,9 @@ def test_single_stage_prefill_normalizes_transport_markers_and_uses_vit_only_for
     class FakeCache:
         def __init__(self, _layers: int) -> None:
             self.seq_lens = [0]
+
+        def copy(self) -> FakeCache:
+            return FakeCache(0)
 
     calls: dict[str, Any] = {"vae": 0, "vit": 0, "texts": []}
     pipeline = _pipeline()

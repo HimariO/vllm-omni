@@ -49,6 +49,7 @@ from vllm_omni.model_executor.models.sensenova_vision.cfg_expand import IMG2IMG_
 from vllm_omni.model_executor.models.sensenova_vision.configuration_sensenova_vision import (
     SENSENOVA_VISION_PREPROCESSOR_CONFIG as _SENSENOVA_VISION_PREPROCESSOR_CONFIG,
 )
+from vllm_omni.outputs.output_metadata import DiffusionMetadata, DiffusionPayload, DiffusionPayloadValue
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.models.bagel.autoencoder import AutoEncoder
@@ -66,7 +67,7 @@ class SenseNovaVisionGenParams:
     timestep_shift: float = 3.0
     cfg_text_scale: float = 4.0
     cfg_img_scale: float = 1.0
-    cfg_interval: tuple = (0.4, 1.0)
+    cfg_interval: tuple[float, float] = (0.4, 1.0)
     cfg_renorm_min: float = 1.0
     cfg_renorm_type: str = "global"
     # SenseNovaVision-specific additive flags (not consumed by the BAGEL core).
@@ -75,7 +76,7 @@ class SenseNovaVisionGenParams:
     max_think_token_n: int = 1000
     do_sample: bool = False
     text_temperature: float = 0.3
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_base_params(cls, mode: str) -> SenseNovaVisionGenParams:
@@ -108,7 +109,7 @@ class SenseNovaVisionGenParams:
 
 # Per-mode defaults, transcribed verbatim from
 # SenseNova-Vision/inference/sensenova_vision.py (BASE_PARAMS).
-_BASE_PARAMS: dict[str, dict[str, Any]] = {
+_BASE_PARAMS: dict[str, dict[str, object]] = {
     "generate": {
         "cfg_text_scale": 4.0,
         "cfg_img_scale": 1.0,
@@ -219,7 +220,7 @@ def get_sensenova_vision_post_process_func(od_config: OmniDiffusionConfig):
 def build_sensenova_vision_diffusion_output(
     *,
     text: str | None = None,
-    image: Any = None,
+    image: DiffusionPayloadValue | None = None,
     think_text: str | None = None,
     stage_durations: dict[str, float] | None = None,
 ) -> DiffusionOutput:
@@ -238,8 +239,8 @@ def build_sensenova_vision_diffusion_output(
     only the existing ``TEXT``/``IMAGE`` output-modality contract and never
     introduces a SenseNovaVision-specific modality key.
     """
-    payload: dict[str, Any] = {}
-    metadata: dict[str, Any] = {}
+    payload: DiffusionPayload = {}
+    metadata: DiffusionMetadata = {}
     text_meta: dict[str, str] = {}
 
     if text is not None:
