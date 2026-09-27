@@ -26,6 +26,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -228,14 +229,25 @@ def test_single_stage_context_resize_uses_sensenova_transforms() -> None:
     assert tuple(recon_vit.shape) == (3, 224, 448)
 
 
-def test_forward_recon3d_decodes_num_views_images() -> None:
-    """``_forward_recon3d`` decodes one PIL image per view and packs them as a list."""
+@pytest.mark.parametrize("raw", [False, True])
+def test_forward_recon3d_decodes_num_views_images(raw: bool) -> None:
+    """Each view receives the request's output type and is packed into the image list."""
     pipeline = _recon3d_pipeline()
-    out = pipeline._forward_recon3d(_recon3d_request(num_views=3))
+    req = _recon3d_request(num_views=3)
+    req.sampling_params.output_type = "raw_tensor" if raw else None
+    seen = []
+
+    def decode(bagel, vae, latent, shape, params):
+        seen.append(params.output_type)
+        return np.zeros((4, 4, 3), dtype=np.float32) if params.output_type == "raw_tensor" else Image.new("RGB", (4, 4))
+
+    pipeline._decode_image_from_latent = decode
+    out = pipeline._forward_recon3d(req)
     payload = out.output["payload"]
     assert isinstance(payload["image"], list)
     assert len(payload["image"]) == 3
-    assert all(isinstance(img, Image.Image) for img in payload["image"])
+    assert all(isinstance(img, np.ndarray if raw else Image.Image) for img in payload["image"])
+    assert seen == [req.sampling_params.output_type] * 3
 
 
 def test_forward_recon3d_single_stage_prefills_locally(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -453,3 +465,50 @@ def test_forward_recon3d_collapses_to_single_packed_sequence() -> None:
     # pre-collapse variable for ``x_0.split`` at inferencer.py:225).
     assert captured["unpack_seqlens"].tolist() == [6, 6, 6]
     assert len(out.output["payload"]["image"]) == 3
+
+
+def _raw_pipeline() -> SenseNovaVisionPipeline:
+    """Build a SenseNovaVisionPipeline instance without loading weights."""
+    pipeline = object.__new__(SenseNovaVisionPipeline)
+    pipeline.bagel = SimpleNamespace(
+        latent_downsample=2,
+        latent_patch_size=2,
+        latent_channel=3,
+    )
+    pipeline.vae = SimpleNamespace(
+        decode=lambda latent: latent,
+        parameters=lambda: iter([SimpleNamespace(dtype=torch.float32)]),
+    )
+    pipeline._stage_durations = None
+    pipeline.scheduler = None
+    pipeline.scheduler_kwargs = None
+    pipeline.new_token_ids = {}
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(dtype=torch.float32)
+    return pipeline
+
+
+@pytest.mark.parametrize(
+    "output_type, extra_type, raw",
+    [
+        ("raw_tensor", None, True),
+        (None, "raw_tensor", True),
+        (None, None, False),
+        ("pil", None, False),
+        ("latent", None, False),
+    ],
+)
+def test_latent_decode_output_type(output_type, extra_type, raw):
+    pipeline = _raw_pipeline()
+    params = OmniDiffusionSamplingParams(output_type=output_type, extra_args={"output_type": extra_type})
+    assert pipeline._should_return_raw_tensor(params) is raw
+    latent = torch.full((4, 12), 0.25, dtype=torch.float32)
+    output = pipeline._decode_image_from_latent(pipeline.bagel, pipeline.vae, latent, (4, 4), params)
+    if raw:
+        assert isinstance(output, np.ndarray)
+        assert output.shape == (4, 4, 3)
+        assert output.dtype == np.float32
+        np.testing.assert_array_equal(output, 0.25)
+    else:
+        assert isinstance(output, Image.Image)
+        assert output.size == (4, 4)

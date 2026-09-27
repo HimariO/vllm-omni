@@ -54,6 +54,14 @@ from vllm_omni.diffusion.models.sensenova_vision.tokenization_sensenova_vision i
     VLLMSenseNovaVisionTokenizer,
 )
 from vllm_omni.model_executor.models.bagel import bagel as bagel_module
+from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+    OmniSenseNovaVisionForConditionalGeneration,
+    OmniSenseNovaVisionMultiModalProcessor,
+    OmniSenseNovaVisionProcessingInfo,
+    _sensenova_img2img_token_counts,
+    _sensenova_vae_resize_dims,
+    _sensenova_vit_resize_dims,
+)
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
@@ -203,9 +211,6 @@ def test_sensenova_img2img_expansion_is_upstream_exact(tokenizer, hf_config, inf
     from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
         OmniSenseNovaVisionMultiModalProcessor,
         OmniSenseNovaVisionProcessingInfo,
-        _sensenova_img2img_token_counts,
-        _sensenova_vae_resize_dims,
-        _sensenova_vit_resize_dims,
     )
 
     h, w = 375, 500  # non-square -> resize arithmetic actually exercised
@@ -413,12 +418,161 @@ def test_worst_case_token_budget_arithmetic():
     inside one stage-0 prefill step (``max_num_batched_tokens: 32768``).
     With aspect-aware ViT the 10-image budget also fits in one step.
     """
-    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
-        _sensenova_img2img_token_counts,
-    )
 
     num_vae, num_vit, _, _ = _sensenova_img2img_token_counts(512, 512)
     per_block = num_vae + 1 + num_vit
     assert per_block == 2398
     assert per_block <= 32768
     assert 10 * per_block <= 32768
+
+
+def _model_stub() -> OmniSenseNovaVisionForConditionalGeneration:
+    inst = object.__new__(OmniSenseNovaVisionForConditionalGeneration)
+    inst.latent_downsample = 16
+    inst.max_latent_size = 64
+    inst.latent_channel = 16
+    inst.latent_patch_size = 2
+    inst.config = SimpleNamespace(vit_config=SimpleNamespace(image_size=64, patch_size=14))
+    inst.device = torch.device("cpu")
+    return inst
+
+
+def test_resize_methods_select_the_right_grid() -> None:
+    inst = _model_stub()
+    pv = torch.zeros(1, 3, 200, 300)
+    assert inst._resize_to_stride(pv).shape[2:] == (512, 768)
+    assert inst._resize_to_recon3d_vae(pv).shape[2:] == (256, 384)
+    # ViT transforms operate on the already-VAE-resized image.
+    assert inst._resize_for_vit(torch.zeros(1, 3, 384, 512)).shape[2:] == (378, 518)
+    assert inst._resize_to_recon3d_vit(torch.zeros(1, 3, 384, 512)).shape[2:] == (336, 448)
+
+
+# ---------------------------------------------------------------------------
+# Embed gate: 1 image -> default VAE grid, >1 images -> recon3d VAE grid
+# ---------------------------------------------------------------------------
+
+
+def _wire_embed_fakes(inst, calls: dict) -> None:
+    """Attach the fakes ``_process_img2img_input`` needs; record resize calls."""
+
+    def fake_vit_embeddings(images):
+        calls["vit_sizes"] = [tuple(img.shape[-2:]) for img in images]
+        return [torch.zeros((img.shape[-2] // 14) * (img.shape[-1] // 14), 4) for img in images]
+
+    class _FakeVAE:
+        def encode(self, x):
+            return torch.zeros(x.shape[0], 16, x.shape[2] // 8, x.shape[3] // 8)
+
+    orig_stride = OmniSenseNovaVisionForConditionalGeneration._resize_to_stride
+    orig_recon3d = OmniSenseNovaVisionForConditionalGeneration._resize_to_recon3d_vae
+    orig_vit_default = OmniSenseNovaVisionForConditionalGeneration._resize_for_vit
+    orig_vit_recon3d = OmniSenseNovaVisionForConditionalGeneration._resize_to_recon3d_vit
+
+    def stride_resize(pv):
+        calls.setdefault("stride", []).append(tuple(pv.shape[2:]))
+        return orig_stride(inst, pv)
+
+    def recon3d_resize(pv):
+        calls.setdefault("recon3d", []).append(tuple(pv.shape[2:]))
+        return orig_recon3d(inst, pv)
+
+    def vit_default(pv):
+        calls.setdefault("vit_default", []).append(tuple(pv.shape[2:]))
+        return orig_vit_default(inst, pv)
+
+    def vit_recon3d(pv):
+        calls.setdefault("vit_recon3d", []).append(tuple(pv.shape[2:]))
+        return orig_vit_recon3d(inst, pv)
+
+    inst._vit_embeddings = fake_vit_embeddings
+    inst._resize_to_stride = stride_resize
+    inst._resize_to_recon3d_vae = recon3d_resize
+    inst._resize_for_vit = vit_default
+    inst._resize_to_recon3d_vit = vit_recon3d
+    inst.vae = _FakeVAE()
+    inst.get_flattened_position_ids = lambda *a, **k: torch.zeros(1, dtype=torch.long)
+    inst.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda ids: torch.zeros(len(ids), 4)))
+    inst.vae2llm = lambda z: torch.zeros(z.shape[0], 4)
+    inst.latent_pos_embed = lambda pos: torch.zeros(1, 4)
+    inst.time_embedder = lambda t: torch.zeros(1, 4)
+    inst._start_of_image_id = 151652
+    inst._end_of_image_id = 151653
+    inst._ropes_pending = []
+    inst._pending_img2img_info = []
+    inst._img2img_info_by_size = {}
+    inst._img2img_by_req = {}
+    inst._last_img2img_info = None
+
+
+def test_embed_single_image_uses_default_vae_grid() -> None:
+    inst = _model_stub()
+    calls: dict = {}
+    _wire_embed_fakes(inst, calls)
+
+    inst._process_img2img_input({"pixel_values": torch.zeros(1, 1, 3, 200, 300)})
+
+    assert calls.get("recon3d") is None, "single image must not take the recon3d transform"
+    assert calls.get("vit_recon3d") is None, "single image must not take the recon3d ViT transform"
+    assert calls["stride"] == [(200, 300)]
+    # ViT sees the default-chain dims of the VAE-resized image.
+    assert calls["vit_default"] == [(512, 768)]
+    # info (h_px, w_px) follows the default grid and feeds kv_metadata["image_shape"].
+    infos = list(inst._img2img_info_by_size.values())
+    assert len(infos) == 1 and infos[0][2:] == (512, 768)
+    assert len(inst._pending_img2img_info) == 1
+
+
+def test_embed_multi_image_uses_recon3d_vae_grid() -> None:
+    inst = _model_stub()
+    calls: dict = {}
+    _wire_embed_fakes(inst, calls)
+
+    inst._process_img2img_input({"pixel_values": torch.zeros(1, 2, 3, 200, 300)})
+
+    assert calls.get("stride") is None, "multi-view must not take the default transform"
+    assert calls.get("vit_default") is None, "multi-view must not take the default ViT transform"
+    assert calls["recon3d"] == [(200, 300)] * 2
+    # ViT sees the recon3d-chain dims of the VAE-resized image.
+    assert calls["vit_recon3d"] == [(256, 384)] * 2
+    assert calls["vit_sizes"] == [(252, 378)] * 2
+    # Every view's info carries the recon3d VAE dims -> DiT image_shape.  The
+    # size cache is keyed by (num_vae, num_vit), so two identical views
+    # collapse to one entry (base-class dedup); the pending list stays 1/image.
+    infos = list(inst._img2img_info_by_size.values())
+    assert len(infos) == 1 and infos[0][2:] == (256, 384)
+    assert len(inst._pending_img2img_info) == 2
+    assert all(info[2:] == (256, 384) for info in inst._pending_img2img_info)
+
+
+# ---------------------------------------------------------------------------
+# Processor parity: placeholder counts must match the embed-side gate
+# ---------------------------------------------------------------------------
+
+
+def _img2img_placeholder_lengths(proc, tokenizer, sizes_w_h: list[tuple[int, int]]) -> list[int]:
+    images = [Image.new("RGB", size) for size in sizes_w_h]
+    mm_items = MultiModalDataItems({"img2img": bagel_module.Img2ImgProcessorItems(images)})
+    updates = proc._get_prompt_updates(mm_items, {}, MultiModalKwargsItems())
+    mm_prompt_updates = proc._bind_and_group_updates(updates, mm_items.get_all_counts())
+    prompt_ids = [tokenizer.convert_tokens_to_ids("<|fim_middle|>")] * len(sizes_w_h)
+    _new_ids, placeholders = proc._apply_prompt_updates(prompt_ids, mm_prompt_updates)
+    blocks = placeholders["img2img"]
+    assert [ph.item_idx for ph in blocks] == list(range(len(sizes_w_h)))
+    return [ph.length for ph in blocks]
+
+
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_placeholder_matches_runtime_embeddings(num_images, tokenizer, info_ctx):
+    info = OmniSenseNovaVisionProcessingInfo(info_ctx)
+    proc = object.__new__(OmniSenseNovaVisionMultiModalProcessor)
+    proc.info = info
+    proc.dummy_inputs = None
+    proc.cache = None
+    proc.data_parser = info.get_data_parser()
+    model = _model_stub()
+    calls: dict[str, list[tuple[int, int]]] = {}
+    _wire_embed_fakes(model, calls)
+    embeddings = model._process_img2img_input({"pixel_values": torch.zeros(1, num_images, 3, 200, 300)})
+    lengths = _img2img_placeholder_lengths(proc, tokenizer, [(300, 200)] * num_images)
+    # The separator token remains text, outside the VAE and ViT embedding ranges.
+    assert lengths == [embedding.shape[0] + 1 for embedding in embeddings]
