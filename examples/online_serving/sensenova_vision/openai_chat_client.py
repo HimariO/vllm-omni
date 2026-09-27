@@ -8,7 +8,7 @@ SenseNova-Vision OpenAI-compatible chat client.
 Demonstrates the SenseNova-Vision modality matrix against an
 ``vllm-omni serve`` endpoint.  At minimum the client exercises:
 
-- mixed (caption_generate): image + intermediate caption text in one response
+- mixed (caption_generate): caption-conditioned segmentation image
 - img2text: image understanding via the OpenAI chat completions API
 - text2img: image generation
 
@@ -23,7 +23,7 @@ Usage:
         --image-url /path/to/photo.jpg \
         --prompt "What are the main objects in this scene and their relationships?"
 
-    # Mixed text + image (caption_generate)
+    # Caption-conditioned segmentation image (caption_generate)
     python openai_chat_client.py --modality mixed \
         --image-url /path/to/photo.jpg \
         --output sensenova_vision_mixed.png
@@ -97,9 +97,9 @@ def generate(
     through the model extra registry.
 
     Returns:
-        ``(image_bytes, text)``.  Exactly one of the two is non-None for a
-        single-modality request; the ``mixed`` (caption_generate) mode may
-        return both.
+        ``(image_bytes, text)``. Exactly one is non-None. The ``mixed``
+        (``caption_generate``) mode requests the image because OpenAI serving
+        does not serialize the intermediate caption alongside an image.
     """
     content = [{"type": "text", "text": _format_prompt(modality, prompt)}]
 
@@ -113,7 +113,8 @@ def generate(
     if modality == "mixed":
         # The single-stage chat endpoint routes any request containing
         # ``text`` through its text-only response branch. Request the image
-        # so the segmentation result reaches the OpenAI response.
+        # so the segmentation result reaches the OpenAI response. The
+        # intermediate caption remains available through offline inference.
         payload["modalities"] = ["image"]
     elif modality in ("text2img", "img2img", "img2dense"):
         payload["modalities"] = ["image"]
@@ -185,7 +186,7 @@ def main():
     parser = argparse.ArgumentParser(description="SenseNova-Vision multimodal chat client")
     parser.add_argument("--prompt", "-p", default=None, help="Text prompt (official per-mode default if omitted)")
     parser.add_argument("--output", "-o", default="sensenova_vision_output.png", help="Output file (for image results)")
-    parser.add_argument("--text-output", type=Path, help="Optional file for text results (including mixed captions)")
+    parser.add_argument("--text-output", type=Path, help="Optional file for text-only results")
     parser.add_argument("--server", "-s", default="http://localhost:8092", help="Server URL")
     parser.add_argument("--image-url", "-i", nargs="+", help="Input image URL(s) or local path(s)")
     parser.add_argument(

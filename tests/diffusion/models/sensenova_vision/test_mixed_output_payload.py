@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Regression tests for the SenseNovaVision mixed text+image output contract.
+"""Regression tests for the SenseNovaVision offline mixed-output contract.
 
 SenseNovaVision ``caption_generate`` / ``think_generate`` produce an image together
-with its caption/reasoning text.  Phase 3 wires that mixed payload through the
-existing ``TEXT | IMAGE`` output-modality contract: the pipeline exposes the
-text under ``payload["text"]`` alongside ``payload["image"]``, the diffusion
-formatter preserves it in ``multimodal_output``, and the serving layer
-serializes it as a leading ``{type: text}`` OpenAI content part.  No
-SenseNovaVision-specific output modality keys are introduced.
+with its caption/reasoning text. The pipeline exposes the text under
+``payload["text"]`` alongside ``payload["image"]`` and preserves it in
+``metadata.text`` for offline consumers. The shared formatter continues to use
+the image as the primary output without introducing a mixed OpenAI response.
 
 These tests are CPU-only and construct the payload dict exactly as the
 pipeline produces it (via :func:`build_sensenova_vision_diffusion_output`); no model
@@ -34,7 +32,6 @@ from vllm_omni.diffusion.output_formatter import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
@@ -82,14 +79,13 @@ def test_build_sensenova_vision_diffusion_output_carries_text_and_image() -> Non
     assert output.stage_durations == {"execute": 1.25}
 
 
-def test_mixed_payload_formats_to_image_with_text_multimodal_output(
+def test_mixed_payload_formats_to_image_with_caption_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A mixed payload serializes as an image output that keeps its caption.
+    """A mixed payload formats as an image with offline caption metadata.
 
-    The formatter infers ``image`` as the primary key (the shared contract is
-    ``TEXT | IMAGE``), so ``result.images`` carries the image while
-    ``result.multimodal_output["text"]`` keeps the caption for serving.
+    The shared formatter does not promote secondary text to a top-level
+    multimodal output. Offline consumers recover it from ``metadata.text``.
     """
     monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
     image = _image()
@@ -113,7 +109,7 @@ def test_mixed_payload_formats_to_image_with_text_multimodal_output(
 
     assert result.images == [image]
     assert result.final_output_type == "image"
-    assert result.multimodal_output["text"] == _CAPTION
+    assert "text" not in result.multimodal_output
     assert result.multimodal_output["metadata"]["text"] == {
         "text_output": _CAPTION,
         "think_text": "thinking before caption",
@@ -186,47 +182,6 @@ def test_merge_is_additive_when_text_already_present() -> None:
 
     assert merged is existing
     assert merged.output["payload"]["text"] == "keep me"
-
-
-def test_diffusion_text_content_part_serializes_caption() -> None:
-    """The serving helper emits an OpenAI ``{type: text}`` content part."""
-    part = OmniOpenAIServingChat._diffusion_text_content_part({"text": _CAPTION, "image": _image()})
-    assert part == {"type": "text", "text": _CAPTION}
-
-    assert OmniOpenAIServingChat._diffusion_text_content_part({}) is None
-    assert OmniOpenAIServingChat._diffusion_text_content_part({"text": "   "}) is None
-    assert OmniOpenAIServingChat._diffusion_text_content_part(None) is None
-
-
-def test_create_image_choice_emits_text_then_image_parts() -> None:
-    """A mixed output serializes to ``[text, image_url]`` content parts."""
-    image = _image()
-    omni_outputs = SimpleNamespace(
-        request_output=None,
-        stage_durations={"diffusion": 0.25},
-        peak_memory_mb=10.0,
-        images=[image],
-        outputs=[],
-        multimodal_output={
-            "text": _CAPTION,
-            "image": image,
-            "metadata": {"text": {"text_output": _CAPTION}},
-        },
-    )
-
-    choices = OmniOpenAIServingChat._create_image_choice(  # type: ignore[misc]
-        None,
-        omni_outputs=omni_outputs,
-        role="assistant",
-        request=SimpleNamespace(return_token_ids=False),
-    )
-
-    assert len(choices) == 1
-    content = choices[0].message.content
-    assert isinstance(content, list)
-    assert [part["type"] for part in content] == ["text", "image_url"]
-    assert content[0] == {"type": "text", "text": _CAPTION}
-    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
 def _make_pipeline() -> SenseNovaVisionPipeline:
@@ -314,9 +269,3 @@ def test_merge_leaves_payload_unchanged_without_text() -> None:
     assert merged is output
     assert "text" not in merged.output["payload"]
     assert merged.output["metadata"] == {}
-
-
-def test_diffusion_text_content_part_unwraps_single_item_list() -> None:
-    """Single-element list text values (producer convention) are unwrapped."""
-    part = OmniOpenAIServingChat._diffusion_text_content_part({"text": [_CAPTION]})
-    assert part == {"type": "text", "text": _CAPTION}

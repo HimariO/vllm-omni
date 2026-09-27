@@ -4,8 +4,8 @@
 """
 End-to-end online serving test for SenseNova-Vision-7B-MoT.
 
-Validates the OpenAI-compatible img2img request format and mixed
-``caption_generate`` response path exposed by ``vllm-omni serve``.
+Validates the OpenAI-compatible img2img request format and the image-only
+``caption_generate`` workaround exposed by ``vllm-omni serve``.
 
 Equivalent to running:
     vllm serve RzZ/SenseNova-Vision-7B-MoT --omni \\
@@ -63,8 +63,8 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
     ]
 
 
-def _build_img2text_messages(prompt: str, image_b64: str) -> list[dict]:
-    """Build OpenAI-format messages for img2text understanding."""
+def _build_caption_generate_messages(prompt: str, image_b64: str) -> list[dict]:
+    """Build OpenAI-format messages for caption-conditioned segmentation."""
     return [
         {
             "role": "user",
@@ -109,8 +109,8 @@ def test_sensenova_vision_img2img_online(omni_server, openai_client) -> None:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_sensenova_vision_mixed_online(omni_server, openai_client) -> None:
-    """Test SenseNovaVision mixed text+image (caption_generate) via chat API."""
+def test_sensenova_vision_caption_generate_image_online(omni_server, openai_client) -> None:
+    """Test the image-only online workaround for ``caption_generate``."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     buffer = BytesIO()
     input_image.save(buffer, format="JPEG")
@@ -118,13 +118,14 @@ def test_sensenova_vision_mixed_online(omni_server, openai_client) -> None:
 
     request_config = {
         "model": omni_server.model,
-        "messages": _build_img2text_messages(MIXED_PROMPT, image_b64),
-        "modalities": ["image", "text"],
+        "messages": _build_caption_generate_messages(MIXED_PROMPT, image_b64),
+        "modalities": ["image"],
         "extra_body": {
             "height": 512,
             "width": 512,
             "num_inference_steps": 2,
             "seed": 42,
+            "extra_args": {"sensenova_vision_mode": "caption_generate"},
         },
     }
 
