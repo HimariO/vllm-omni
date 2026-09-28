@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """SenseNova-Vision-7B-MoT config helpers.
 
@@ -18,6 +18,7 @@ import os
 from typing import Any
 
 from vllm.logger import init_logger
+from vllm.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
 
@@ -90,18 +91,15 @@ def merge_sensenova_split_configs(config_root: str, hf_config_path: str) -> None
 
     # Resolve the checkpoint root (local dir or HF cache) for the sibling files.
     if not os.path.isdir(config_root):
-        try:
-            from huggingface_hub import hf_hub_download
 
-            def _load_sibling(name: str) -> dict | None:
-                try:
-                    p = hf_hub_download(config_root, name)
-                    with open(p) as f:
-                        return json.load(f)
-                except Exception:
-                    return None
-        except Exception:
-            return
+        def _load_sibling(name: str) -> dict | None:
+            try:
+                path = hf_api().hf_hub_download(config_root, name)
+                with open(path) as f:
+                    return json.load(f)
+            except Exception as exc:
+                logger.debug("SenseNova-Vision: cannot load %s: %s", name, exc)
+                return None
     else:
 
         def _load_sibling(name: str) -> dict | None:

@@ -17,9 +17,10 @@ model-specific example clients. The offline example
 (`examples/offline_inference/sensenova_vision/end2end.py`) covers the full modality
 matrix with `--modality` flags, official per-mode default prompts, and
 client-side decoders for dense and 3D outputs. The online example
-(`examples/online_serving/sensenova_vision/openai_chat_client.py`) demonstrates the
-mixed `caption_generate` mode (image + intermediate text) plus image
+(`examples/online_serving/sensenova_vision/openai_chat_client.py`) covers image
 understanding and image generation through the OpenAI chat completions API.
+For the single-stage server's `mixed` / `caption_generate` request behavior,
+see the online limitation below.
 
 ## References
 
@@ -225,17 +226,31 @@ vllm serve sensenova/SenseNova-Vision-7B-MoT \
   --deploy-config vllm_omni/deploy/sensenova_vision.yaml
 ```
 
-Send a mixed text + image request (`caption_generate` returns both an image
-and the intermediate caption text) with the Python client:
+Send a mixed text + image request with the Python client:
 
 ```bash
 cd examples/online_serving/sensenova_vision
 python openai_chat_client.py \
   --modality mixed \
   --image-url /path/to/photo.jpg \
-  --prompt "<image> Please briefly describe the contents of the image. Please respond with interleaved segmentation masks for the corresponding parts of the answer." \
+  --prompt "Please briefly describe the contents of the image. Please respond with interleaved segmentation masks for the corresponding parts of the answer." \
   --output /tmp/sensenova_vision_mixed.png
 ```
+
+##### `gcg_seg` / `mixed` single-stage workaround
+
+The single-stage chat handler currently treats any request whose output
+`modalities` include `"text"` as a text-only response. A true mixed request
+(`['image', 'text']`) therefore completes the image denoising stage but
+serializes only the text response, dropping the returned image.
+
+The bundled client works around this by sending `mixed` requests with
+`modalities: ["image"]`. The generated segmentation image is consequently
+returned and saved to `--output`. This workaround does **not** return the
+intermediate caption in the OpenAI response, so `--text-output` is not created
+for this case. Returning both artifacts requires a serving-layer mixed-response
+implementation; no core serving behavior is changed by this recipe/client
+workaround.
 
 Image understanding (img2text):
 

@@ -19,8 +19,7 @@ from a single unified pipeline. It is served with a two-stage topology:
 The modality matrix includes `text2text`, `img2text` (captioning, dense
 detection, dense OCR), `text2img` (generate), `img2img` (edit), `img2dense`
 (depth / normal / segmentation), multi-image camera pose estimation, multi-view
-reconstruction (`recon3d`), and the mixed `caption_generate` mode that returns
-both an image and intermediate caption text.
+reconstruction (`recon3d`), and the `caption_generate` segmentation-image mode.
 
 ## Launch the Server
 
@@ -103,10 +102,12 @@ curl http://localhost:8092/v1/chat/completions \
   -d @payload.json
 ```
 
-### Mixed Text + Image (caption_generate)
+### Caption-Conditioned Segmentation Image (caption_generate)
 
-The `caption_generate` mode returns both a generated image and the
-intermediate caption text. The client saves the image and prints the text.
+The client requests `modalities: ["image"]`, so the OpenAI response contains
+the generated segmentation image. The intermediate caption is not serialized
+alongside the image by the chat endpoint. Use the offline inference example
+when both the mask and caption are required from one request.
 
 ```bash
 python openai_chat_client.py \

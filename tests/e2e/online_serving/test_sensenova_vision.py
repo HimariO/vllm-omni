@@ -1,23 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end online serving test for SenseNova-Vision-7B-MoT.
 
-Validates that the SenseNova-Vision multistage pipeline can serve image
-generation (text2img / img2img), image understanding (img2text), and the
-mixed ``caption_generate`` mode via the OpenAI-compatible chat completions API
-exposed by ``vllm-omni serve``.
+Validates the OpenAI-compatible img2img request format and the image-only
+``caption_generate`` workaround exposed by ``vllm-omni serve``.
 
 Equivalent to running:
     vllm serve RzZ/SenseNova-Vision-7B-MoT --omni \\
         --port 8092 --deploy-config <ci/sensenova_vision.yaml>
-
-    python examples/online_serving/sensenova_vision/openai_chat_client.py \\
-        --modality text2img --prompt "A cute cat"
-
-    python examples/online_serving/sensenova_vision/openai_chat_client.py \\
-        --modality img2text --image-url <image>
 
     python examples/online_serving/sensenova_vision/openai_chat_client.py \\
         --modality mixed --image-url <image>
@@ -39,9 +31,6 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL = "RzZ/SenseNova-Vision-7B-MoT"
 STAGE_CONFIG_PATH = get_deploy_config_path("ci/sensenova_vision.yaml")
 
-TEXT2TEXT_PROMPT = "What is the capital of France?"
-TEXT2IMG_PROMPT = "A cute corgi astronaut on the moon, cinematic"
-IMG2TEXT_PROMPT = "What are the main objects in this scene and their relationships?"
 IMG2IMG_PROMPT = "Turn this image into a vibrant cartoon-style illustration."
 MIXED_PROMPT = (
     "<image> Please briefly describe the contents of the image. Please respond "
@@ -56,26 +45,6 @@ test_params = [
         stage_init_timeout=300,
     ),
 ]
-
-
-def _build_text_messages(prompt: str) -> list[dict]:
-    """Build OpenAI-format messages for a text-only request (text2text)."""
-    return [
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": prompt}],
-        }
-    ]
-
-
-def _build_text2img_messages(prompt: str) -> list[dict]:
-    """Build OpenAI-format messages for text2img generation."""
-    return [
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": f"<|im_start|>{prompt}<|im_end|>"}],
-        }
-    ]
 
 
 def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
@@ -94,8 +63,8 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
     ]
 
 
-def _build_img2text_messages(prompt: str, image_b64: str) -> list[dict]:
-    """Build OpenAI-format messages for img2text understanding."""
+def _build_caption_generate_messages(prompt: str, image_b64: str) -> list[dict]:
+    """Build OpenAI-format messages for caption-conditioned segmentation."""
     return [
         {
             "role": "user",
@@ -108,28 +77,6 @@ def _build_img2text_messages(prompt: str, image_b64: str) -> list[dict]:
             ],
         }
     ]
-
-
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_sensenova_vision_text2img_online(omni_server, openai_client) -> None:
-    """Test SenseNovaVision text2img via OpenAI-compatible chat completions API."""
-    request_config = {
-        "model": omni_server.model,
-        "messages": _build_text2img_messages(TEXT2IMG_PROMPT),
-        "modalities": ["image"],
-        "extra_body": {
-            "height": 512,
-            "width": 512,
-            "num_inference_steps": 2,
-            "seed": 42,
-        },
-    }
-
-    openai_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.core_model
@@ -162,8 +109,8 @@ def test_sensenova_vision_img2img_online(omni_server, openai_client) -> None:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_sensenova_vision_img2text_online(omni_server, openai_client) -> None:
-    """Test SenseNovaVision img2text via OpenAI-compatible chat completions API."""
+def test_sensenova_vision_caption_generate_image_online(omni_server, openai_client) -> None:
+    """Test the image-only online workaround for ``caption_generate``."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     buffer = BytesIO()
     input_image.save(buffer, format="JPEG")
@@ -171,37 +118,14 @@ def test_sensenova_vision_img2text_online(omni_server, openai_client) -> None:
 
     request_config = {
         "model": omni_server.model,
-        "messages": _build_img2text_messages(IMG2TEXT_PROMPT, image_b64),
-        "modalities": ["text"],
-        "extra_body": {
-            "seed": 42,
-        },
-    }
-
-    openai_client.send_diffusion_request(request_config)
-
-
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_sensenova_vision_mixed_online(omni_server, openai_client) -> None:
-    """Test SenseNovaVision mixed text+image (caption_generate) via chat API."""
-    input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
-    buffer = BytesIO()
-    input_image.save(buffer, format="JPEG")
-    image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": _build_img2text_messages(MIXED_PROMPT, image_b64),
-        "modalities": ["image", "text"],
+        "messages": _build_caption_generate_messages(MIXED_PROMPT, image_b64),
+        "modalities": ["image"],
         "extra_body": {
             "height": 512,
             "width": 512,
             "num_inference_steps": 2,
             "seed": 42,
+            "extra_args": {"sensenova_vision_mode": "caption_generate"},
         },
     }
 

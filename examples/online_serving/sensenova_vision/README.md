@@ -4,8 +4,8 @@ OpenAI-compatible chat completions API for
 [`sensenova/SenseNova-Vision-7B-MoT`](https://huggingface.co/sensenova/SenseNova-Vision-7B-MoT),
 served by `vllm-omni`. The server exposes the full SenseNova-Vision modality
 matrix through the standard chat API: text2text, img2text, text2img, img2img,
-dense perception, multi-view camera pose, recon3d, and the mixed
-`caption_generate` mode (image + intermediate text).
+dense perception, multi-view camera pose, recon3d, and the
+`caption_generate` segmentation-image mode.
 
 ## Launch the Server
 
@@ -93,7 +93,7 @@ curl http://localhost:8092/v1/chat/completions \
   -d @payload.json
 ```
 
-### Mixed text + image (caption_generate)
+### Caption-conditioned segmentation image (caption_generate)
 
 ```bash
 python openai_chat_client.py \
@@ -103,8 +103,11 @@ python openai_chat_client.py \
     --output sensenova_vision_mixed.png
 ```
 
-The `caption_generate` mode returns both a generated image and the
-intermediate caption text; the client saves the image and prints the text.
+The client requests `modalities: ["image"]`, so the OpenAI response contains
+the generated segmentation image. The intermediate caption is not serialized
+alongside the image by the chat endpoint. Use the
+[offline example](../../offline_inference/sensenova_vision/README.md) when both
+the mask and caption are required from one inference request.
 
 ### Image to Image (img2img)
 

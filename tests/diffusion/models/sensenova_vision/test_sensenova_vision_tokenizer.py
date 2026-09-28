@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the SenseNova-Vision tokenizer vocab sizing.
 
 The SenseNova-Vision-7B-MoT LLM has ``vocab_size = 152064`` (``llm_config.json``)
@@ -59,7 +59,7 @@ def _cached_checkpoint() -> str | None:
         return env_path
     snapshot = os.path.expanduser("~/.cache/huggingface/hub/models--sensenova--SenseNova-Vision-7B-MoT/snapshots/*")
     matches = sorted(glob.glob(snapshot))
-    return matches[-1] if matches else None
+    return str(matches[-1]) if matches else None
 
 
 @pytest.fixture()
@@ -68,6 +68,7 @@ def sensenova_vision_checkpoint() -> str:
     checkpoint = _cached_checkpoint()
     if checkpoint is None:
         pytest.skip("SenseNova-Vision-7B-MoT not cached and SENSENOVA_VISION_MODEL_PATH is unset")
+    assert checkpoint is not None
     return checkpoint
 
 

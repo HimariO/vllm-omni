@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the SenseNova-Vision end2end example formatters.
 
 Guards the #2/#3 divergence bug class permanently: every formatter's prompt
@@ -47,6 +47,10 @@ from examples.offline_inference.sensenova_vision.end2end import (
     _official_text,
 )
 from vllm_omni.model_executor.models.bagel.bagel import Img2ImgProcessorItems
+from vllm_omni.model_executor.stage_input_processors.bagel import (
+    GEN_THINK_SYSTEM_PROMPT,
+    VLM_THINK_SYSTEM_PROMPT,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -209,7 +213,7 @@ def _placeholders_bind_all_items(prompt: dict, tokenizer, info_ctx) -> None:
     for modality in ("image", "img2img"):
         if modality not in placeholders:
             continue
-        covered = set()
+        covered: set[int] = set()
         for ph in placeholders[modality]:
             covered.update(range(ph.start_idx, ph.start_idx + len(ph.tokens)))
         assert covered, f"{modality}: placeholder ranges must be non-empty"
@@ -361,6 +365,8 @@ def test_think_text2text_wraps_with_vlm_system_prompt():
     num_pads, num_fims = _assert_prompt_matches_mm_data(p)
     assert (num_pads, num_fims) == (0, 0)
     assert p["mode"] == "think_understanding"
+    assert VLM_THINK_SYSTEM_PROMPT in p["prompt"]
+    assert GEN_THINK_SYSTEM_PROMPT not in p["prompt"]
     # system turn + user turn + opened assistant continuation.
     assert f"{_IM_START}system\n" in p["prompt"]
     assert p["prompt"].endswith(f"{_IM_START}user\nwhat is here?{_IM_END}\n{_IM_START}assistant\n")
@@ -371,6 +377,10 @@ def test_think_text2img_wraps_with_gen_system_prompt():
     num_pads, num_fims = _assert_prompt_matches_mm_data(p)
     assert (num_pads, num_fims) == (0, 0)
     assert p["mode"] == "think_generate"
+    assert GEN_THINK_SYSTEM_PROMPT in p["prompt"]
+    assert VLM_THINK_SYSTEM_PROMPT not in p["prompt"]
+    assert p["prompt"].count(_IM_START) == 2
+    assert p["prompt"].count(_IM_END) == 1
     assert p["prompt"].startswith(f"{_IM_START}system\n")
 
 

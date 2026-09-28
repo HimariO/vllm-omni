@@ -26,6 +26,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -36,10 +37,6 @@ from vllm_omni.diffusion.models.sensenova_vision.pipeline_sensenova_vision impor
     SenseNovaVisionPipeline,
 )
 from vllm_omni.diffusion.models.sensenova_vision.transforms_sensenova_vision import (
-    PER_TASK_VAE_SIDE,
-    PER_TASK_VIT_SIDE,
-    ResizeSpec,
-    max_long_edge_resize,
     packed_seqlens,
     recon3d_packing,
 )
@@ -72,55 +69,6 @@ def test_packed_seqlens_n2() -> None:
     """Per-branch packed_seqlens = (h*w + 2) markers; latent 32x32 -> 1026."""
     seqlens = packed_seqlens(2, 32, 32)
     assert seqlens == [1026, 1026]
-
-
-def test_per_task_vae_side_contract() -> None:
-    """recon3d selects VAE 512; camera-pose has no VAE prefill."""
-    assert PER_TASK_VAE_SIDE["recon3d"] == 512
-    assert PER_TASK_VAE_SIDE["camera_pose"] is None
-
-
-def test_per_task_vit_side_contract() -> None:
-    """recon3d ViT 448 / camera-pose ViT 560."""
-    assert PER_TASK_VIT_SIDE["recon3d"] == 448
-    assert PER_TASK_VIT_SIDE["camera_pose"] == 560
-
-
-def test_resize_spec_target_side() -> None:
-    """Stride-aligned square target: largest stride multiple <= max_size."""
-    # ImageTransform(512, 256, 16) -> 512; (448, 224, 14) -> 448; (560, 378, 14) -> 560.
-    assert ResizeSpec(512, 256, 16).target_side == 512
-    assert ResizeSpec(448, 224, 14).target_side == 448
-    assert ResizeSpec(560, 378, 14).target_side == 560
-
-
-def test_resize_spec_vae_grid() -> None:
-    """Latent grid for the recon3d VAE side (downsample 8, patch 2 -> 16)."""
-    grid = ResizeSpec(512, 256, 16).vae_grid(latent_downsample=16)
-    assert grid == (32, 32)
-
-
-def test_max_long_edge_resize_downscales_to_target() -> None:
-    """A square input above the max downscales to the stride-aligned target."""
-    img = Image.new("RGB", (700, 700))
-    fn = max_long_edge_resize(512, 256, 16)
-    out = fn(img)
-    assert out.size == (512, 512)
-
-
-def test_resize_does_not_upscale_below_target() -> None:
-    """Inputs already within max_size are left at their native size (no upscale)."""
-    img = Image.new("RGB", (256, 256))
-    out = max_long_edge_resize(512, 256, 16)(img)
-    assert out.size == (256, 256)
-
-
-def test_max_long_edge_resize_clamps_stride() -> None:
-    """Output side is a multiple of stride and never below stride."""
-    img = Image.new("RGB", (1024, 1024))
-    out = max_long_edge_resize(560, 378, 14)(img)
-    assert out.size[0] % 14 == 0
-    assert out.size[0] <= 560
 
 
 def _make_naive_cache(seq_len: int) -> NaiveCache:
@@ -281,14 +229,25 @@ def test_single_stage_context_resize_uses_sensenova_transforms() -> None:
     assert tuple(recon_vit.shape) == (3, 224, 448)
 
 
-def test_forward_recon3d_decodes_num_views_images() -> None:
-    """``_forward_recon3d`` decodes one PIL image per view and packs them as a list."""
+@pytest.mark.parametrize("raw", [False, True])
+def test_forward_recon3d_decodes_num_views_images(raw: bool) -> None:
+    """Each view receives the request's output type and is packed into the image list."""
     pipeline = _recon3d_pipeline()
-    out = pipeline._forward_recon3d(_recon3d_request(num_views=3))
+    req = _recon3d_request(num_views=3)
+    req.sampling_params.output_type = "raw_tensor" if raw else None
+    seen = []
+
+    def decode(bagel, vae, latent, shape, params):
+        seen.append(params.output_type)
+        return np.zeros((4, 4, 3), dtype=np.float32) if params.output_type == "raw_tensor" else Image.new("RGB", (4, 4))
+
+    pipeline._decode_image_from_latent = decode
+    out = pipeline._forward_recon3d(req)
     payload = out.output["payload"]
     assert isinstance(payload["image"], list)
     assert len(payload["image"]) == 3
-    assert all(isinstance(img, Image.Image) for img in payload["image"])
+    assert all(isinstance(img, np.ndarray if raw else Image.Image) for img in payload["image"])
+    assert seen == [req.sampling_params.output_type] * 3
 
 
 def test_forward_recon3d_single_stage_prefills_locally(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -506,3 +465,50 @@ def test_forward_recon3d_collapses_to_single_packed_sequence() -> None:
     # pre-collapse variable for ``x_0.split`` at inferencer.py:225).
     assert captured["unpack_seqlens"].tolist() == [6, 6, 6]
     assert len(out.output["payload"]["image"]) == 3
+
+
+def _raw_pipeline() -> SenseNovaVisionPipeline:
+    """Build a SenseNovaVisionPipeline instance without loading weights."""
+    pipeline = object.__new__(SenseNovaVisionPipeline)
+    pipeline.bagel = SimpleNamespace(
+        latent_downsample=2,
+        latent_patch_size=2,
+        latent_channel=3,
+    )
+    pipeline.vae = SimpleNamespace(
+        decode=lambda latent: latent,
+        parameters=lambda: iter([SimpleNamespace(dtype=torch.float32)]),
+    )
+    pipeline._stage_durations = None
+    pipeline.scheduler = None
+    pipeline.scheduler_kwargs = None
+    pipeline.new_token_ids = {}
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(dtype=torch.float32)
+    return pipeline
+
+
+@pytest.mark.parametrize(
+    "output_type, extra_type, raw",
+    [
+        ("raw_tensor", None, True),
+        (None, "raw_tensor", True),
+        (None, None, False),
+        ("pil", None, False),
+        ("latent", None, False),
+    ],
+)
+def test_latent_decode_output_type(output_type, extra_type, raw):
+    pipeline = _raw_pipeline()
+    params = OmniDiffusionSamplingParams(output_type=output_type, extra_args={"output_type": extra_type})
+    assert pipeline._should_return_raw_tensor(params) is raw
+    latent = torch.full((4, 12), 0.25, dtype=torch.float32)
+    output = pipeline._decode_image_from_latent(pipeline.bagel, pipeline.vae, latent, (4, 4), params)
+    if raw:
+        assert isinstance(output, np.ndarray)
+        assert output.shape == (4, 4, 3)
+        assert output.dtype == np.float32
+        np.testing.assert_array_equal(output, 0.25)
+    else:
+        assert isinstance(output, Image.Image)
+        assert output.size == (4, 4)

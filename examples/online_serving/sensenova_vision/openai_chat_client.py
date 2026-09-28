@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 SenseNova-Vision OpenAI-compatible chat client.
 
 Demonstrates the SenseNova-Vision modality matrix against an
 ``vllm-omni serve`` endpoint.  At minimum the client exercises:
 
-- mixed (caption_generate): image + intermediate caption text in one response
+- mixed (caption_generate): caption-conditioned segmentation image
 - img2text: image understanding via the OpenAI chat completions API
 - text2img: image generation
 
@@ -20,7 +23,7 @@ Usage:
         --image-url /path/to/photo.jpg \
         --prompt "What are the main objects in this scene and their relationships?"
 
-    # Mixed text + image (caption_generate)
+    # Caption-conditioned segmentation image (caption_generate)
     python openai_chat_client.py --modality mixed \
         --image-url /path/to/photo.jpg \
         --output sensenova_vision_mixed.png
@@ -52,10 +55,36 @@ def _encode_image(image_url: str) -> str:
     return image_url
 
 
+def _format_prompt(modality: str, prompt: str) -> str:
+    """Apply the SenseNova-Vision scaffold required for image generation.
+
+    Text-output requests deliberately remain ordinary chat content: the OpenAI
+    serving layer renders their user/assistant and image-pad tokens.  Image
+    requests bypass that rendering so their control tokens must be supplied by
+    the client, matching the offline ``end2end.py`` format.
+    """
+    im_start = "<|im_start|>"
+    im_end = "<|im_end|>"
+
+    if modality == "text2img":
+        return f"{im_start}{prompt}{im_end}"
+    if modality in ("img2img", "img2dense"):
+        # The serving model processor inserts <|fim_middle|> when img2img
+        # media is present, so retain the same user text span as offline.
+        return f"{im_start}{prompt}{im_end}"
+    if modality == "mixed":
+        # caption_generate needs VAE+ViT conditioning followed by a bare BOS
+        # from which the AR stage decodes the complete interleaved caption.
+        # This is byte-for-byte the offline formatter's scaffold.
+        text = prompt.replace("<image>", "").strip()
+        return f"<|fim_middle|>{im_start}{text}{im_end}{im_start}"
+    return prompt
+
+
 def generate(
     prompt: str,
     server_url: str = "http://localhost:8092",
-    image_url: str | None = None,
+    image_url: str | list[str] | None = None,
     modality: str = "text2img",
     **kwargs: object,
 ) -> tuple[bytes | None, str | None]:
@@ -68,19 +97,26 @@ def generate(
     through the model extra registry.
 
     Returns:
-        ``(image_bytes, text)``.  Exactly one of the two is non-None for a
-        single-modality request; the ``mixed`` (caption_generate) mode may
-        return both.
+        ``(image_bytes, text)``. Exactly one is non-None. The ``mixed``
+        (``caption_generate``) mode requests the image because OpenAI serving
+        does not serialize the intermediate caption alongside an image.
     """
-    content = [{"type": "text", "text": prompt}]
+    content = [{"type": "text", "text": _format_prompt(modality, prompt)}]
 
-    if image_url:
-        content.append({"type": "image_url", "image_url": {"url": _encode_image(image_url)}})
+    image_urls = [image_url] if isinstance(image_url, str) else (image_url or [])
+    for url in image_urls:
+        content.append({"type": "image_url", "image_url": {"url": _encode_image(url)}})
 
     messages = [{"role": "user", "content": content}]
     payload: dict = {"messages": messages}
 
-    if modality in ("text2img", "img2img", "mixed"):
+    if modality == "mixed":
+        # The single-stage chat endpoint routes any request containing
+        # ``text`` through its text-only response branch. Request the image
+        # so the segmentation result reaches the OpenAI response. The
+        # intermediate caption remains available through offline inference.
+        payload["modalities"] = ["image"]
+    elif modality in ("text2img", "img2img", "img2dense"):
         payload["modalities"] = ["image"]
     else:
         payload["modalities"] = ["text"]
@@ -88,6 +124,22 @@ def generate(
     for key, val in kwargs.items():
         if val is not None and val is not False:
             payload[key] = val
+
+    # The OpenAI serving layer carries this model-specific selector to the
+    # SenseNova pipeline. It is needed for the dense and mixed variants whose
+    # output modality alone cannot identify the inference mode.
+    mode_by_modality = {
+        "text2img": "generate",
+        "img2img": "edit",
+        "img2text": "understanding",
+        "text2text": "understanding",
+        "img2dense": "dense_perception",
+        "dense_detection": "dense_detection",
+        "dense_OCR": "dense_OCR",
+        "multi-img2text": "understanding",
+        "mixed": "caption_generate",
+    }
+    payload["extra_args"] = {"sensenova_vision_mode": mode_by_modality[modality]}
 
     try:
         print(f"Sending {modality} request to {server_url}...")
@@ -134,14 +186,31 @@ def main():
     parser = argparse.ArgumentParser(description="SenseNova-Vision multimodal chat client")
     parser.add_argument("--prompt", "-p", default=None, help="Text prompt (official per-mode default if omitted)")
     parser.add_argument("--output", "-o", default="sensenova_vision_output.png", help="Output file (for image results)")
+    parser.add_argument("--text-output", type=Path, help="Optional file for text-only results")
     parser.add_argument("--server", "-s", default="http://localhost:8092", help="Server URL")
-    parser.add_argument("--image-url", "-i", type=str, help="Input image URL or local path")
+    parser.add_argument("--image-url", "-i", nargs="+", help="Input image URL(s) or local path(s)")
     parser.add_argument(
         "--modality",
         "-m",
         default="text2img",
-        choices=["text2img", "img2img", "img2text", "text2text", "mixed"],
+        choices=[
+            "text2img",
+            "img2img",
+            "img2text",
+            "text2text",
+            "img2dense",
+            "dense_detection",
+            "dense_OCR",
+            "multi-img2text",
+            "mixed",
+        ],
         help="Task modality",
+    )
+    parser.add_argument(
+        "--dense-task",
+        choices=["depth", "normal", "segmentation"],
+        default="depth",
+        help="Dense prediction task (used with --modality img2dense).",
     )
     # Standard generation parameters
     parser.add_argument("--height", type=int, default=1024, help="Image height")
@@ -161,21 +230,32 @@ def main():
         "img2img": "Turn this image into a vibrant cartoon-style illustration.",
         "img2text": "What are the main objects in this scene and their relationships?",
         "text2text": "What is the capital of France?",
+        "img2dense": {
+            "depth": "Estimate relative depth for each pixel in the image, with closer objects appearing brighter and distant objects appearing darker. Output is a grayscale image with pixel values ranging from 0-255.",
+            "normal": "Generate an RGB normal map where R, G, B channels represent X, Y, Z surface directions. The output should show continuous color variations with no discrete regions, unlike segmentation results.",
+            "segmentation": "Could you return the binary segmentation masks for the specified categories: <p>person furthest to the right</p>?",
+        },
+        "dense_detection": "Please detect all instances of <p>bird</p>, <p>boat</p>, <p>person</p>, <p>cell phone</p>, <p>backpack</p>, <p>handbag</p> in the image. Output the results as a structured text list with each detection including category and bounding box coordinates in <bbox> format.",
+        "dense_OCR": "Please recognize all the text in the image. Output the results as a structured text list with each detection including the recognized text and its bounding box coordinates in <bbox> format.",
+        "multi-img2text": "With the first frame as the reference frame, output the relative pose of all subsequent frames (excluding the first frame) with respect to the first frame.",
         "mixed": (
-            "<image> Please briefly describe the contents of the image. Please respond "
+            "Please briefly describe the contents of the image. Please respond "
             "with interleaved segmentation masks for the corresponding parts of the answer."
         ),
     }
-    prompt = args.prompt or default_prompts[args.modality]
+    default_prompt = default_prompts[args.modality]
+    if args.modality == "img2dense":
+        default_prompt = default_prompt[args.dense_task]
+    prompt = args.prompt or default_prompt
 
     print(f"Mode: {args.modality}")
     if args.image_url:
-        print(f"Input Image: {args.image_url}")
+        print(f"Input Image(s): {', '.join(args.image_url)}")
 
     extra: dict[str, object] = {
         "seed": args.seed,
     }
-    if args.modality in ("text2img", "img2img", "mixed"):
+    if args.modality in ("text2img", "img2img", "img2dense", "mixed"):
         extra.update(
             height=args.height,
             width=args.width,
@@ -207,6 +287,10 @@ def main():
         saved = True
     if text:
         print(f"[Response]\n{text}")
+        if args.text_output:
+            args.text_output.parent.mkdir(parents=True, exist_ok=True)
+            args.text_output.write_text(text, encoding="utf-8")
+            print(f"Text saved to: {args.text_output}")
         saved = True
     if not saved:
         print("Failed to generate response")

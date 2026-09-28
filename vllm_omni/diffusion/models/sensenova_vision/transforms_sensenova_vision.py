@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-Vision multi-view / per-task pre-processing primitives.
 
 This module ports the resize semantics the official SenseNova-Vision repo
